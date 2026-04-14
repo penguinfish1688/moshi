@@ -1,0 +1,64 @@
+"""
+Please implement the following Python function based on the docstring. 
+Use the 'openai' library to call the LLM judge, and handle concurrent API calls if possible to speed up the evaluation.
+"""
+
+import pandas as pd
+import json
+import OpenAI
+import os
+
+class Q2Data:
+    def __init__(self, dir_path, interruption_question, expected_answer, model_response):
+        self.dir_path = dir_path
+        self.interruption_question = interruption_question
+        self.expected_answer = expected_answer
+        self.model_response = model_response
+
+def model_response_for_q2(root_dir, model_response_time=15, buffer_time=1):
+    """
+    For each root_dir/*/ there will be transcript created by Full-Duplex-Bench/get_transcript/asr.py
+    You only want to extrac the models reponse for question 2, which is the interruption question. 
+    The models audio's reponse will be in root_dir/*/output.wav and it will be talking for model_response_time
+    seconds till the end of the audio. So you know the start of the response will be at (total_duration - model_response_time)
+    and you add a buffer_time to be safe. So you want to extract the transcript from (total_duration - model_response_time - buffer_time) to the end of the audio.
+    the transcript will be in root_dir/*/output_transcript.json and it will have the timestamps for each word
+
+    Make the words in the transcript to be a sentence.
+
+    Return a list of Q2Data objects, one for each root_dir/*/ where you have the dir_path (which is root_dir/*/), 
+    the interruption_question, the expected_answer, the model_response (the sentence you extracted from the transcript)
+
+    the interruption_question and expected_answer can be extracted from a file called root_dir/*/user_interrupts_text.json
+    
+    """
+
+
+def evaluate_with_gpt(data_list: list[Q2Data], openai_client: OpenAI, max_workers=10) -> list[Q2Data]:
+    """
+    Takes a list of Q2Data, concurrently sends the extracted text to GPT-4o-mini (or GPT-4o) 
+    to evaluate if the model correctly answered the interruption (0 or 1).
+    Updates the gpt_score and gpt_reason attributes of each Q2Data object and returns the list.
+    
+    Use the SYSTEM_PROMPT defined above to guide the evaluation.
+
+    Save the results in a JSON file called "q2_evaluation_results.json" under each root_dir/*/. 
+    each root_dir/*/ is give in the dir_path attribute of Q2Data.
+    """
+    SYSTEM_PROMPT = '''
+    You are a strict, objective evaluator grading an AI voice assistant's ability to handle sudden interruptions. 
+    The user interrupted the AI with a specific True/False or direct question. 
+    Your ONLY job is to determine if the AI accurately heard and answered the expected ground truth.
+
+    [Grading Rules (Binary 0 or 1)]
+    Score 1 (Success): 
+    The AI's response clearly matches the Expected Ground Truth Answer. Acceptable forms include saying "True", "False", "Yes", "No", or giving a correct short answer directly addressing the question.
+
+    Score 0 (Failure): 
+    Assign 0 if ANY of the following occur:
+    - The AI gave the WRONG answer (e.g., expected 'True' but answered 'False').
+    - The AI ignored the question and continued its previous topic.
+    - The AI gave an ambiguous, confused, or irrelevant response.
+
+    Output ONLY a valid JSON object: {"score": <0 or 1>, "reason": "<brief 1-sentence explanation>"}
+    '''

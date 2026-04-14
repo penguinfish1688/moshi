@@ -1,0 +1,46 @@
+def calculate_steering_vector(root_dir, classifier_path, decay_span, alpha):
+    """
+    read input_timing.json for each <root_dir>/*/input_timing.json
+    {
+        "interrupt_start": 1.54, # in seconds, when user starts interrupting
+    }
+    The token generation rate is 12.5Hz
+
+    Starting from interrupt_start, we can calculate which token index is being generated at that time
+    at that token index, we calculate the steering vector, which can be done by feeding the classifier_path
+    to extract_normal_vector() in mode_class.py, which will return a normalized normal vector.
+    times that vector by alpha as the steering vector for that token index. For the following token indices 
+    within decay_span (e.g., 10 tokens), we apply a decayed steering vector by multiplying the normal vector 
+    with alpha * decay_factor, where decay_factor linearly decays from 1 to 0 over the decay_span. After decay_span, the steering vector is set to null (no steering).
+
+    to see how many tokens are in the root-dir/*/ you read the input.wav file and use 12.5 hz to count token numbers. make sure
+    the steering_vector.json can be read by inference_with_steering() in the next step and pass the assert.
+
+
+    
+    Now save the steering vector for each token index in root-dir/*/steering_vector.json. The format of steering_vector.json 
+    should be like this:
+    to know what layer you are, you can read the classifier_path.pt that should contain taht. the classifier is trained in mode_class.py
+    if there it, let's say, already have layer_10, and you are calculating layer_22. just add layer_22 into it, don't overwrite layer_10. 
+    if there is already layer_22, just update it.
+    {
+        "layer_10": {
+            "0": [0.1, 0.2, ...],   # vector for token 0 (first generated token)
+            "1": [0.05, -0.1, ...], # vector for token 1
+            ...
+            "2": null               # if token 2 doesn't need to be steered
+        },
+        "layer_22": {
+            "0": null,
+            "1": [0.01, -0.02, ...],
+            ...
+            "2": [0.03, 0.04, ...]
+        },
+    }
+
+    Notes:
+    - Token indices are 0-based (must start at "0").
+    - Keys are strings in JSON.
+    - Missing token indices are treated as "no steering" (equivalent to null).
+    """
+    pass

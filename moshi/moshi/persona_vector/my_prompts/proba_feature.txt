@@ -1,0 +1,63 @@
+"""
+You are an expert PyTorch/NLP engineer. I am working on an inference-time intervention script for an LLM/Speech-Language Model. 
+
+I need you to implement a lightweight Python class named `TokenProbabilityFeatureExtractor`. This class will maintain a sliding window of the last N=100 generated tokens and extract 4 specific token probability features (plus 1 entropy feature) at each generation step, based on the definitions from Quevedo et al. (2024).
+
+Please write the class with the following specifications:
+
+1. Initialization:
+- `window_size` defaults to 100.
+- Use `collections.deque` with `maxlen=100` to store intermediate step-wise calculations. This ensures O(1) time complexity for appending new steps and automatically discarding old ones.
+
+2. Step Update Method:
+`def update(self, probs: torch.Tensor, generated_token_id: int)`
+- `probs`: A 1D PyTorch tensor of shape `[vocab_size]` representing the softmax probability distribution of the current step.
+- `generated_token_id`: An integer representing the token ID that was actually sampled/selected at this step.
+- At each step, calculate and store the following intermediate values in the deque:
+  * `p_t`: The probability of the generated token -> `probs[generated_token_id]`
+  * `p_v_star`: The maximum probability in the vocabulary -> `torch.max(probs)`
+  * `p_v_minus`: The minimum probability in the vocabulary -> `torch.min(probs)`
+  * `step_entropy`: The Shannon entropy of the distribution -> `-torch.sum(probs * torch.log(probs + 1e-10))`
+
+3. Feature Extraction Method:
+`def get_features(self) -> dict:`
+- This method aggregates the values currently in the deque to calculate and return 5 scalar features (floats). If the deque is empty, return None or 0.0 for all.
+- The features to calculate over the current window are:
+  * `mtp` (Minimum Token Probability): The minimum of `p_t` across the window.
+  * `avgtp` (Average Token Probability): The mean of `p_t` across the window.
+  * `Mpd` (Maximum Probability Deviation): The maximum of `(p_v_star - p_t)` across the window.
+  * `mps` (Minimum Probability Spread): The minimum of `(p_v_star - p_v_minus)` across the window.
+  * `max_entropy`: The maximum of `step_entropy` across the window.
+
+Constraints:
+- Do not implement any downstream classifiers (no Logistic Regression or Neural Networks). Just the feature extraction.
+- Keep the code extremely efficient, as it will run at every inference step (zero-latency requirement).
+- Return the exact Python code with typing hints and docstrings.
+
+
+the main script will take a argument --root-dir and will take all --root-dir/*/input_hidden.pt or somehting like that 
+(the sturcture example is [chang168@login007 data]$ ls -R candor_turn_taking_mini/
+    candor_turn_taking_mini/:
+    1  10  2  3  4  5  6  7  8  9  candor_turn_taking_mini_2
+
+    candor_turn_taking_mini/1:
+    final_token_probability_0_137.png  input_amplitude.png         logits_evolution_60_137.png  output_hidden.pt                 turn_taking.json
+    input.json                         logits_evolution_0_137.png  output.json                  pad_lookback_ratio_0_137.png
+    input.wav                          logits_evolution_19_80.png  output.wav                   pad_token_probability_0_137.png
+
+    candor_turn_taking_mini/10:
+    final_token_probability_0_120.png  input.wav                   output.json  output_hidden.pt              pad_token_probability_0_120.png
+    input.json                         logits_evolution_0_120.png  output.wav   pad_lookback_ratio_0_120.png  turn_taking.json
+
+    candor_turn_taking_mini/2:
+    final_token_probability_0_136.png  input.wav            logits_evolution_0_136.png  output.wav        pad_lookback_ratio_0_136.png     turn_taking.json
+    input.json                         input_amplitude.png  output.json                 output_hidden.pt  pad_token_probability_0_136.png
+
+    candor_turn_taking_mini/3:
+)
+and also a function that calculate the prob from the saved .pt hidden. Also add a argument to specify the layer you wanna calculate, by default should be the last layer.
+save the results to <root-dir>/*/prob_feature.json should contain the corresponding token index (greedy decode), decoded token name, and this token's proba feature (four number)
+The code need to be minimal and clean
+Don't run on local machine as no gpu, only static check
+
+"""

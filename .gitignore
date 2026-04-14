@@ -163,6 +163,7 @@ cython_debug/
 
 # VsCode
 .vscode/
+notes.md
 
 *~
 *.safetensors

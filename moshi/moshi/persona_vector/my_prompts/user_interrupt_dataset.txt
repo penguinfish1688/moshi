@@ -1,0 +1,62 @@
+import os
+import json
+import random
+import math
+
+def create_interrupt_dataset(
+    root_dir: str, 
+    num_samples: int = 100,
+    initial_silence: float = 3.0, 
+    duration_1_ave: float = 6.0, 
+    duration_1_range: float = 2.0, 
+    duration_2: float = 15.0
+):
+    """
+    Creates a dataset of user interrupts to test full-duplex model coherence.
+    
+    Directory Structure Output:
+    <root_dir>/000/user_interrupts_text.json
+    <root_dir>/001/user_interrupts_text.json
+    ... up to <num_samples>
+    
+    Each JSON file must strictly follow this schema:
+    {
+        "question_1": str,              # A complex, open-ended question requiring a long response.
+        "response_duration_1": float,   # Sampled from uniform distribution: [ave - range/2, ave + range/2]
+        "question_2": str,              # A True/False interruption question about a word definition.
+        "question_2_starting_word": str,# The actual subject of the question.
+        "question_2_describing_word": str, # The word that the definition actually belongs to.
+        "question_2_consistent": bool,  # True if starting_word == describing_word, False otherwise.
+        "question_2_answer": bool,      # Should be the same as question_2_consistent.
+        "response_duration_2": float    # Fixed to the `duration_2` parameter.
+    }
+
+    AGENT IMPLEMENTATION INSTRUCTIONS:
+    1. Create a hardcoded list of at least 20 diverse, open-ended `question_1` strings 
+       (e.g., "Can you explain the history of the Roman Empire?", "How does a quantum computer work?").
+    2. Create a hardcoded dictionary of at 100 nouns and their factual descriptions. 
+       Format: {word: description}. 
+       Example: {"zebra": "a striped animal native to Africa", "dumpling": "a kind of Chinese food"}.
+    3. Loop `num_samples` times to create the directories and JSON files.
+    4. For each iteration, randomly select a `question_1`.
+    5. Calculate `response_duration_1` using random.uniform(ave - range/2, ave + range/2).
+    6. Construct `question_2`:
+       - Flip a coin (50% chance) for `is_consistent`.
+       - Pick a random word from the dictionary as `word_1` (starting_word).
+       - If `is_consistent` is True: 
+           `word_2` (describing_word) = `word_1`.
+       - If `is_consistent` is False: 
+           Pick a DIFFERENT random word from the dictionary as `word_2`.
+       - Construct the string: "{word_1} is {description of word_2}, is this information correct?"
+    7. Save the resulting dictionary as nicely formatted JSON in the respective numbered subfolder.
+    there should be 100 jsons
+    """
+    
+    # [AGENT: Implement the logic here based on the instructions above]
+    pass
+
+# Execute generation
+if __name__ == "__main__":
+    target_dir = os.path.join(os.path.dirname(__file__), "interrupt_dataset")
+    os.makedirs(target_dir, exist_ok=True)
+    create_interrupt_dataset(target_dir, num_samples=10)

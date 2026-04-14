@@ -1,0 +1,75 @@
+    """
+    Computes the Attention Null-Space Projection Steering Vector for Zero-Latency Barge-in.
+
+    
+
+    ### 1. The Physics & Theory (The "Why")
+    In real-time streaming LLMs (like Moshi), when the model is heavily generating 
+    audio/text (Speaking Mode), its Attention Mechanism assigns massive weights to its 
+    own past generated tokens (K_speak). When a user interrupts (Barge-in), the model 
+    suffers from "Attention Inertia" and ignores the user's input, leading to high latency 
+    and poor correctness.
+    
+    This function computes an optimal steering vector `V` to be added to the residual 
+    stream of the user's interruption token: `x_new = x_user + V`.
+    
+    The goal of `V` is twofold (Constrained Optimization):
+    1. Driving Force: Align with `V_svm` (a semantic mode-switching vector, e.g., Delta Mu) 
+       to force the model to transition from "Speaking" to "Listening".
+    2. Constraint (The Null-Space Shield): Minimize any interference with the attention 
+       scores of the system prompt and crucial listening context (`K_listen`).
+       
+    The closed-form analytical solution derived from the Q-K dot-product dynamics is:
+    V_ultimate = alpha * V_svm * (M_listen)^-1
+    where M_listen is the Global Multi-Head Listen Covariance Matrix.
+
+    ### 2. Multi-Head Attention (MHA) & RoPE Handling (The "How")
+    Since Moshi uses MHA and Rotary Position Embeddings (RoPE), a single vector `V` in the 
+    residual stream (dimension: d_model) will be projected into `H` different heads.
+    
+    If RoPE is used, the effective Query projection for a specific token position `m` is:
+    W_q_tilde^(h) = W_q^(h) * RoPE_Rotation_Matrix(m)
+    
+    The Global Covariance Matrix M_listen (shape: [d_model, d_model]) is the SUM of the 
+    covariances across all heads:
+    M_listen = SUM_{h=1 to H} [ W_q_tilde^(h) @ K_l^(h).T @ K_l^(h) @ W_q_tilde^(h).T ]
+    
+    By multiplying V_svm with the pseudo-inverse of M_listen, `V` is projected onto the 
+    null-space of K_listen across ALL heads simultaneously.
+
+    ### 3. Tensor Dimensions & Requirements
+    Args:
+        W_q_weights (torch.Tensor): The Query projection weights from the target layer.
+            Shape: [num_heads, head_dim, d_model] or [d_model, d_model] depending on the architecture.
+            Must be reshaped internally to [num_heads, head_dim, d_model].
+        K_listen (torch.Tensor): The Key cache tensors captured when the model was actively 
+            listening (e.g., system prompt + user input).
+            Shape: [batch=1, num_heads, seq_len_listen, head_dim].
+        V_svm (torch.Tensor): The baseline steering vector (e.g., from SVM or Delta Mu) 
+            representing the "Listen Mode" semantic direction.
+            Shape: [1, d_model] or [d_model].
+        alpha (float): Scaling factor for the interruption strength. Default: 1.0.
+        lambda_reg (float): Tikhonov regularization term to ensure matrix invertibility. 
+            Default: 1e-5.
+        rope_cos (torch.Tensor, optional): Cosine cache for RoPE.
+        rope_sin (torch.Tensor, optional): Sine cache for RoPE.
+        position_id (int, optional): The token position ID of the interrupt token, used to 
+            fetch the correct RoPE frequencies.
+
+    Returns:
+        torch.Tensor: The optimal steering vector `V`. Shape: [1, d_model].
+        
+    ### 4. Implementation Steps for the Agent:
+    1. Reshape `W_q_weights` to separate the heads: `[num_heads, head_dim, d_model]`.
+    2. (Optional but recommended) Apply RoPE rotation to `W_q_weights` based on `position_id`.
+       Since W_q transforms `x` -> `q`, applying RoPE to W_q creates the effective `W_q_tilde`.
+    3. Loop over each head `h`:
+       a. Extract `W_h = W_q_tilde[h]` (shape: [head_dim, d_model]).
+       b. Extract `K_h = K_listen[0, h]` (shape: [seq_len, head_dim]).
+       c. Compute `Proj_h = W_h.T @ K_h.T` (shape: [d_model, seq_len]).
+       d. Compute Covariance for this head: `Cov_h = Proj_h @ Proj_h.T` (shape: [d_model, d_model]).
+    4. Sum `Cov_h` across all heads to get `M_listen` (shape: [d_model, d_model]).
+    5. Add regularization: `M_listen += lambda_reg * torch.eye(d_model)`.
+    6. Compute the pseudo-inverse: `M_inv = torch.linalg.pinv(M_listen)`.
+    7. Compute final vector: `V = alpha * (V_svm @ M_inv)`.
+    """

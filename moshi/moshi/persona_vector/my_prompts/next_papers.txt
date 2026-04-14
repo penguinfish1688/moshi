@@ -1,0 +1,19 @@
+這段話後面列舉了四個被學界成功「抓出來」的經典電路（這裡面就有我上一篇跟你提到的例子！）：
+
+Equivariance in visual recognition (Olah et al., 2020)：
+
+白話文：視覺模型裡的「不變性電路」。研究員抓出了一組神經元，這組神經元專門負責告訴模型：「不管這隻狗是正著放還是倒著放，牠都是一隻狗。」
+
+In-context learning (Olsson et al., 2022) 👈 這就是我剛才提的！
+
+白話文：這就是大名鼎鼎的 「歸納頭 (Induction Heads)」 論文！他們抓出了一個專門負責「複製貼上」的電路。當你在 Prompt 裡給模型幾個範例，這個電路就會啟動，強制模型接下來的輸出必須模仿前面的格式。
+
+Indirect object identification (Wang et al., 2023a)：
+
+白話文：「間接受詞辨識電路」。當你說 "Mary gave the ring to John"，模型是怎麼知道要把戒指給 John 而不是 Mary 的？他們精準定位到了負責這個「文法邏輯」的神經元路徑。
+
+Mapping answer text to answer labels (Lieberum et al.)：
+
+白話文：「答案映射電路」。負責把模型腦中複雜的想法，精準對應到 "A", "B", "C" 這種選擇題選項的神經路徑。
+
+Is it possible to find turn taking circuit?

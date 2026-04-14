@@ -1,0 +1,36 @@
+"""Create a dataset for training a linear classifier
+Create dataset under /home/penguinfish/personaplex/Full-Duplex-Bench/data/mode_class
+
+ /home/penguinfish/personaplex/Full-Duplex-Bench/data/mode_class/1 is given example, 
+ finish up to mode_class/
+
+It should generate the dataset like this.
+For each input.json, there should be two sentence, the complete_sentence should be a sentence of 
+40-60 words on random topic
+and incomplete_sentence should be the first 20-30 words of the compelte sentence, and the cut off
+should be at the end of a word, not in the middle of a word. and the cut should leave the sentence
+have incomplte meaning, a sentence is like "You are a dog, and you like to bark", you CANNOT cut it to "You are a dog"
+You must cut like "you are a dog, and" or "you are a dog, and you like"
+
+
+高度多樣性（Diversity）： 這 100 句話應該涵蓋不同的主題（日常對話、專業學術、情緒表達）、不同的長度（短句、長段落）以及不同的語氣。如果你「說話模式」的 50 句話全都在談論天氣，那麼你的分類器可能會不小心變成一個「天氣探測器」。
+
+避免固定模板： 千萬不要用固定的句型（例如每一句都用「我現在要說：...」開頭）。模型非常聰明且偷懶，它可能會直接對特定的字眼（Token）產生反應，而不是真正捕捉到「模式」的切換。
+
+控制變因（對稱性）： 盡量確保「聆聽」和「說話」的資料在整體長度和結構分佈上是相似的，這樣分類器才不會單純因為「句子比較長」就做出錯誤判斷。
+
+
+領域涵蓋： 日常閒聊、科技與程式碼、歷史文學、情感困擾、數學邏輯、商業撰寫等。
+
+長度錯落： 混合 5 個字的極短句，以及 30-50 個字的中長段落。
+
+語氣變化： 包含生氣、疑惑、客氣、專業、幽默等不同口吻。
+
+拒絕固定模板：
+
+聆聽模式不要全部用「請幫我...」或「你知道...嗎」開頭。
+
+說話模式不要全部用「好的...」或「作為一個AI...」開頭。句型必須極度自然且不重複。
+
+The sentence is in english
+"""

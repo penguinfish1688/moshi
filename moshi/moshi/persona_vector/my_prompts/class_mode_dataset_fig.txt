@@ -1,0 +1,7 @@
+plot the results for prediction
+the y axis is the prediction. but I don't want to just binary 0 or 1. the saved results has
+confidence score, reverse the results to [0,1] using the predicted class and confidence score
+the x axis is each token
+for each token, do the same thing as premature_decode.py, need to have its decoded token name (the token that has the max prob)
+and for the x axis also write the user's transcript as indicated in input.json. if no input.json then warning, and then just don't plot the user's words
+read carefully the plot format in premature_decode and the input outptu format of mode_class.py

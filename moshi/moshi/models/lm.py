@@ -1,3 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
 # Copyright (c) Kyutai, all rights reserved.
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
@@ -8,32 +29,35 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import logging
-import typing as tp
-from contextlib import ExitStack
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
-
+from os.path import splitext
+import logging
+import numpy as np
+import sys
+from typing import Optional, Union, List, Tuple, Callable, Iterator
+import sphn
 import torch
-from torch import nn
+from tqdm.auto import tqdm
 
-from ..conditioners import ConditionFuser, ConditionProvider, ConditionTensors
-from ..modules.streaming import State, StreamingContainer, StreamingModule
-from ..modules.transformer import StreamingTransformer, create_norm_fn
-from ..utils.compile import CUDAGraphed
-from ..utils.quantize import replace_linear_with_qlinear
 from ..utils.sampling import sample_token
-from .lm_utils import ScaledEmbedding, _delay_sequence, _init_layer, _undelay_sequence
+from ..utils.compile import CUDAGraphed
+from ..modules.streaming import StreamingStateDict, StreamingContainer, StreamingModule, load_streaming_state
+from ..modules.transformer import (
+    StreamingTransformer,
+    create_norm_fn,
+)
 
 logger = logging.getLogger(__name__)
 
+AUDIO_TOKENS_PER_STREAM = 8
+FRAME_RATE_HZ = 12.5
+SILENCE_TOKENS = np.array([948, 243, 1178, 546, 1736, 1030, 1978, 2008], dtype=np.int64)
+SINE_TOKENS    = np.array([430, 1268, 381, 1611, 1095, 1495, 56, 472], dtype=np.int64)
 
-def scatter_with_mask_(tensor: torch.Tensor, dim: int,
-                       index: torch.Tensor, value: torch.Tensor, mask: torch.Tensor) -> None:
-    """Scatter but skipping the updates that are masked."""
-    old_value = tensor.gather(dim, index)
-    value = torch.where(mask, value, old_value)
-    tensor.scatter_(dim, index, value)
+# Tolerance for silence token matching (number of tokens that must match)
+SILENCE_TOKEN_MATCH_THRESHOLD = 6  # At least 6 out of 8 tokens must match to be considered silence
 
 
 @dataclass
@@ -46,6 +70,172 @@ class LMOutput:
     text_mask: torch.Tensor  # [B, 1, T]
 
 
+@dataclass
+class ForwardCodesOutput:
+    """Structured return for LMModel.forward_codes/forward_embeddings."""
+    transformer_out: torch.Tensor
+    text_logits: torch.Tensor
+    hidden_layers: Optional[List[torch.Tensor]] = None
+    attention_weights: Optional[List[torch.Tensor]] = None
+
+
+@dataclass  
+class HiddenLayerOutputs:
+    """Container for hidden layer outputs from both text and depth transformers."""
+    text_transformer: Optional[List[torch.Tensor]] = None  # List of hidden states from text transformer layers
+    text_attention_weights: Optional[List[torch.Tensor]] = None  # List of attention weights from text transformer layers
+    text_pre_unembed: Optional[torch.Tensor] = None  # Main transformer output after out_norm, before text unembedding.
+    depth_transformer: Optional[List[List[torch.Tensor]]] = None  # List of hidden states from depth transformer layers
+
+
+def _delay_sequence(delays: List[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
+    B, K, T = tensor.shape
+    assert len(delays) == K, (len(delays), K)
+    outs = []
+
+    for k, delay in enumerate(delays):
+        assert delay >= 0
+        line = tensor[:, k].roll(delay, dims=1)
+        if delay > 0:
+            line[:, :delay] = padding[:, k]
+        outs.append(line)
+    return torch.stack(outs, dim=1)
+
+
+def _undelay_sequence(delays: List[int], tensor: torch.Tensor,
+                      fill_value: Union[int, float] = float('NaN')) -> Tuple[torch.Tensor, torch.Tensor]:
+    B, K, T, *_ = tensor.shape
+    assert len(delays) == K
+    mask = torch.ones(B, K, T, dtype=torch.bool, device=tensor.device)
+    outs = []
+    if all([delay == 0 for delay in delays]):
+        return tensor, mask
+    for k, delay in enumerate(delays):
+        assert delay >= 0
+        line = tensor[:, k].roll(-delay, dims=1)
+        if delay > 0:
+            line[:, -delay:] = fill_value
+            mask[:, k, -delay:] = 0
+        outs.append(line)
+    return torch.stack(outs, dim=1), mask
+
+
+def create_sinewave(duration: float, sample_rate: int) -> np.ndarray:
+    """Return a 440 Hz 'silent' sinewave of the given duration."""
+    t = np.linspace(0.0, duration, int(sample_rate * duration), endpoint=False)
+    amplitude = 0.5
+    return amplitude * np.sin(2 * np.pi * 440.0 * t).astype(np.float32)
+
+
+def normalize_audio(wav: np.ndarray, sr: int, target_lufs: float) -> np.ndarray:
+    """Normalize **mono** audio to a target LUFS level."""
+    import pyloudnorm as pyln
+    # Ensure shape is (T,)
+    if wav.ndim == 2 and wav.shape[0] == 1:
+        wav = wav[0]
+
+    meter = pyln.Meter(sr)
+    loudness = meter.integrated_loudness(wav)
+    return pyln.normalize.loudness(wav, loudness, target_lufs)
+
+
+def load_audio(
+    filepath: str, sample_rate: int, 
+):
+    """Yields audio samples in intervals of sample_interval_size"""
+    sample_pcm, sample_sr = sphn.read(filepath)
+    sample_pcm = sphn.resample(
+        sample_pcm, src_sample_rate=sample_sr, dst_sample_rate=sample_rate
+    )  # shape: (C, T)
+    return sample_pcm
+
+def _iterate_audio(sample_pcm, sample_interval_size, max_len=sys.maxsize, pad=True):
+    cnt = 0
+    while sample_pcm.shape[-1] > 0 and cnt < max_len:
+        sample = sample_pcm[:, :sample_interval_size]
+        sample_pcm = sample_pcm[:, sample_interval_size:]
+        if sample_pcm.shape[-1] == 0 and pad:
+            sample = np.concatenate(
+                [
+                    sample,
+                    np.zeros(
+                        (
+                            sample.shape[0],
+                            sample_interval_size - sample.shape[-1],
+                        )
+                    ),
+                ],
+                axis=1,
+            )
+        cnt += 1
+        yield sample[0:1]  # shape: (1, T)
+
+
+def encode_from_sphn(mimi, samples, max_batch=sys.maxsize):
+    """
+    Takes an iterator of samples, batches them, encodes them;
+    and yields the encoded samples one sample at a time in the same order.
+    """
+    device = next(mimi.parameters()).device
+    current_batch = []
+    done_flag = False
+    # TO-DO: Fix the batching bug
+    max_batch = 1
+
+    while True:
+        try:
+            sample = next(samples)
+            tensor = torch.tensor(sample, dtype=torch.float32, device=device)
+            tensor = tensor.unsqueeze(0)  # shape: (1, C, T)                                                                                                      
+            current_batch.append(tensor)
+        except StopIteration:
+            done_flag = True
+
+        if (not done_flag) and len(current_batch) < max_batch:
+            continue
+        if not current_batch:
+            break
+
+        batch = torch.cat(current_batch, dim=0)  # shape: (B, C, T)
+        encoded = mimi.encode(batch)  # shape: (B, K, F)
+        separated = torch.unbind(encoded, dim=0)  # shape: (K, F)
+        reshaped = [x.unsqueeze(0) for x in separated]  # shape: (1, K, F)
+        detached = [x.detach().clone() for x in reshaped]
+
+        current_batch = []
+        yield from detached  # shape: (1, K, F)
+
+        if done_flag:
+            break
+
+
+class ScaledEmbedding(torch.nn.Embedding):
+    """Boost learning rate for embeddings (with `scale`).
+
+    Args:
+        norm (bool): if True, uses a layer norm after the embedding.
+        zero_idx (int): special value indicating that the output should be exactly 0.
+    """
+
+    def __init__(self, *args, norm: bool = False, zero_idx: int = -1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.norm = None
+        if norm:
+            self.norm = create_norm_fn("layer_norm", self.embedding_dim)
+        assert zero_idx < 0, "Please use negative values for the zero_idx."
+        self.zero_idx = zero_idx
+
+    def forward(self, input, *args, **kwargs):
+        is_zero = input == self.zero_idx
+        zero = torch.zeros(1, dtype=input.dtype, device=input.device)
+        input = input.clamp(min=0)
+        y = super().forward(input, *args, **kwargs)
+        if self.norm is not None:
+            y = self.norm(y)
+        y = torch.where(is_zero[..., None], zero, y)
+        return y
+
+
 class LMModel(StreamingContainer):
     """Transformer-based language model on multiple streams of codes.
 
@@ -54,8 +244,6 @@ class LMModel(StreamingContainer):
         dep_q (int): Number of parallel streams to model in the depformer.
         card (int): Cardinality, vocabulary size.
         text_card (int): Cardinality of the text vocabulary.
-        text_card_out (int or None): Cardinality of output text, if different from the input.
-        demux_second_text_stream: (bool): Whether two text streams are muxed together with a cartesian product.
         dim (int): Dimension of the transformer encoder.
         num_heads (int): Number of heads for the transformer encoder.
         hidden_scale (int): Scale for hidden feed forward dimension of the transformer encoder.
@@ -66,22 +254,19 @@ class LMModel(StreamingContainer):
         depformer_multi_linear (bool): if True, uses one linear layer per codebook to project the
             output of the main transformer to the Depformer latent space.
         depformer_dim_feedforward (int| list[int]| None): If None, defaults to hidden_scale * depformer_dim.
-        depformer_weights_per_step_schedule (list[int] | None): mapping `CODEBOOK_INDEX -> WEIGHT_INDEX`, allowing
-        depformer_low_rank_embeddings (int | None): if provided, uses low rank embeddings, with a linear
-        existing_text_padding_id (int): token to use for the padding.
+        existing_text_padding_id (bool): if True, will use a different token for the initial text token, and
+            the text padding token.
         same_initial (bool): if True, uses the same initial tokens for both text and audio mode.
         **kwargs: Additional parameters for the transformer encoder.
     """
 
     def __init__(
         self,
-        delays: tp.List[int] = [0],
+        delays: List[int] = [0],
         n_q: int = 8,
         dep_q: int = 8,
         card: int = 1024,
         text_card: int = 32000,
-        text_card_out: int | None = None,
-        demux_second_text_stream: bool = False,
         dim: int = 128,
         num_heads: int = 8,
         hidden_scale: int = 4,
@@ -93,21 +278,11 @@ class LMModel(StreamingContainer):
         depformer_multi_linear: bool = False,
         depformer_weights_per_step: bool = False,
         depformer_weights_per_step_schedule: list[int] | None = None,
-        depformer_low_rank_embeddings: int | None = None,
         depformer_pos_emb: str = "sin",
-        depformer_norm: str | None = None,
-        existing_text_padding_id: int = 3,
-        existing_text_end_padding_id: int = 0,
-        extra_heads_num_heads: int = 0,
-        extra_heads_dim: int = 6,
-        context: tp.Optional[int] = None,
-        causal: bool = True,
-        condition_provider: tp.Optional[ConditionProvider] = None,
-        fuser: tp.Optional[ConditionFuser] = None,
-        quantize: bool = False,
+        existing_text_padding_id: Optional[int] = None,
+        context: Optional[int] = None,
         device=None,
         dtype=None,
-        gradient_checkpointing: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -115,16 +290,15 @@ class LMModel(StreamingContainer):
         self.dep_q = dep_q
         self.card = card
         self.text_card = text_card
-        text_card_out = text_card if text_card_out is None else text_card_out
-        assert len(delays) == self.num_codebooks, f"expected {self.num_codebooks} delays, got {len(delays)}."
+        assert len(delays) == self.num_codebooks, "unexpected number of delays"
         self.delays = delays
         self.dim = dim
         self.existing_text_padding_id = existing_text_padding_id
-        self.existing_text_end_padding_id = existing_text_end_padding_id
         self.context = context
         self.depformer_weights_per_step_schedule = depformer_weights_per_step_schedule
         if depformer_weights_per_step_schedule is not None:
             assert len(depformer_weights_per_step_schedule) == dep_q
+        kwargs["context"] = context
         EmbeddingFactory = partial(
             ScaledEmbedding,
             norm=norm_emb,
@@ -132,13 +306,15 @@ class LMModel(StreamingContainer):
             dtype=dtype,
             zero_idx=self.zero_token_id,
         )
-        self.emb = nn.ModuleList(
+        self.EmbeddingFactory = EmbeddingFactory
+        self.emb = torch.nn.ModuleList(
             [EmbeddingFactory(self.card + 1, dim) for _ in range(n_q)]
         )
+        # Text card + padding token (if not in the original tokenizer)
+        extra_text = self.existing_text_padding_id is None
         # Unlike for audio, here we authorize the model to output the special token.
-        self.text_emb = EmbeddingFactory(text_card + 1, dim, demux_second_stream=demux_second_text_stream)
-
-        self.text_linear = nn.Linear(dim, text_card_out, bias=bias_proj)
+        self.text_emb = EmbeddingFactory(text_card + 1, dim)
+        self.text_linear = torch.nn.Linear(dim, text_card + extra_text, bias=bias_proj)
         depformer_prefix = "depformer_"
         main_kwargs = {
             k: v for k, v in kwargs.items() if not k.startswith(depformer_prefix)
@@ -150,10 +326,6 @@ class LMModel(StreamingContainer):
             norm=norm,
             device=device,
             dtype=dtype,
-            quantize=quantize,
-            context=context,
-            causal=causal,
-            checkpointing=gradient_checkpointing,
             **main_kwargs,
         )
         self.out_norm = create_norm_fn(norm, dim)
@@ -168,79 +340,38 @@ class LMModel(StreamingContainer):
         )
         kwargs_dep["positional_embedding"] = depformer_pos_emb
         kwargs_dep["context"] = None
-        kwargs_dep["cross_attention"] = False
         if depformer_weights_per_step:
             kwargs_dep["weights_per_step"] = dep_q
         if depformer_multi_linear:
             # One linear layer per codebook to project different informations from the main model.
-            num_in = dep_q
-            if depformer_weights_per_step_schedule:
-                num_in = max(depformer_weights_per_step_schedule) + 1
-            self.depformer_in = nn.ModuleList(
-                [nn.Linear(dim, depformer_dim, bias=False) for _ in range(num_in)]
+            self.depformer_in = torch.nn.ModuleList(
+                [torch.nn.Linear(dim, depformer_dim, bias=False) for _ in range(dep_q)]
             )
         else:
-            self.depformer_in = nn.ModuleList(
-                [nn.Linear(dim, depformer_dim, bias=False)]
+            self.depformer_in = torch.nn.ModuleList(
+                [torch.nn.Linear(dim, depformer_dim, bias=False)]
             )
-        EmbeddingFactory = partial(EmbeddingFactory, low_rank=depformer_low_rank_embeddings)
-        if dep_q > 0:
-            # Only using up to dep_q - 1 because the last codebook is never an input to Depformer.
-            self.depformer_emb = nn.ModuleList(
-                [EmbeddingFactory(self.card + 1, depformer_dim) for _ in range(dep_q - 1)]
-            )
-            self.depformer_text_emb = EmbeddingFactory(
-                text_card + 1,
-                depformer_dim,
-                demux_second_stream=demux_second_text_stream,
-            )
-            if depformer_norm is None:
-                self.depformer_norms = nn.ModuleList([nn.Identity() for _ in range(dep_q)])
-            else:
-                self.depformer_norms = nn.ModuleList(
-                    [create_norm_fn(depformer_norm, depformer_dim) for _ in range(dep_q)])
-            if depformer_dim_feedforward is None:
-                depformer_dim_feedforward = int(hidden_scale * depformer_dim)
-            self.depformer = StreamingTransformer(
-                d_model=depformer_dim,
-                dim_feedforward=depformer_dim_feedforward,
-                norm=norm,
-                weights_per_step_schedule=depformer_weights_per_step_schedule,
-                causal=causal,
-                quantize=quantize,
-                checkpointing=gradient_checkpointing,
-                device=device,
-                dtype=dtype,
-                **kwargs_dep,
-            )
-            # Depformer follow its own cycle of streaming entirely contained in one time step
-            # and should not follow the streaming of the steps dimensions.
-            self.depformer.set_streaming_detached(True)
-        else:  # No-Depformer --- e.g., an ASR model
-            self.depformer_emb = None
-            self.depformer_text_emb = None
-            self.depformer = None
-
-        self.extra_heads = nn.ModuleList(
-            [nn.Linear(dim, extra_heads_dim, bias=False) for _ in range(extra_heads_num_heads)]
+        # Only using up to dep_q - 1 because the last codebook is never an input to Depformer.
+        self.depformer_emb = torch.nn.ModuleList(
+            [EmbeddingFactory(self.card + 1, depformer_dim) for _ in range(dep_q - 1)]
         )
-
+        self.depformer_text_emb = EmbeddingFactory(text_card + 1, depformer_dim)
+        if depformer_dim_feedforward is None:
+            depformer_dim_feedforward = int(hidden_scale * depformer_dim)
+        self.depformer = StreamingTransformer(
+            d_model=depformer_dim,
+            dim_feedforward=depformer_dim_feedforward,
+            norm=norm,
+            device=device,
+            dtype=dtype,
+            **kwargs_dep,
+        )
+        self.depformer.set_streaming_propagate(False)
         dim = depformer_dim  # we will directly apply the next linears to the output of the Depformer.
 
-        self.linears = nn.ModuleList(
-            [nn.Linear(dim, self.card, bias=bias_proj) for _ in range(dep_q)]
+        self.linears = torch.nn.ModuleList(
+            [torch.nn.Linear(dim, self.card, bias=bias_proj) for _ in range(dep_q)]
         )
-        self.to(device=device, dtype=dtype)
-        # We always keep the condition provider as float32.
-        self.condition_provider = condition_provider
-        self.fuser = fuser
-        if self.condition_provider is not None:
-            self.condition_provider.to(device=device)
-        if self.fuser is not None:
-            self.fuser.to(device=device)
-        self._init_weights()
-        if quantize:
-            replace_linear_with_qlinear(self)
 
     @property
     def initial_token_id(self) -> int:
@@ -255,12 +386,15 @@ class LMModel(StreamingContainer):
     @property
     def text_padding_token_id(self) -> int:
         """Token id for text padding."""
-        return self.existing_text_padding_id
+        if self.existing_text_padding_id is None:
+            return self.text_card
+        else:
+            return self.existing_text_padding_id
 
     @property
     def end_of_text_padding_id(self) -> int:
         """Token id for optionally marking the last padding step for a word."""
-        return self.existing_text_end_padding_id
+        return 0
 
     @property
     def zero_token_id(self) -> int:
@@ -277,14 +411,9 @@ class LMModel(StreamingContainer):
         return -2
 
     @property
-    def device(self) -> torch.device:
+    def device(self):
         first_param = next(iter(self.parameters()))
         return first_param.device
-
-    @property
-    def dtype(self) -> torch.dtype:
-        first_param = next(iter(self.text_emb.parameters()))
-        return first_param.dtype
 
     @property
     def num_codebooks(self) -> int:
@@ -296,11 +425,6 @@ class LMModel(StreamingContainer):
 
     @property
     def audio_offset(self) -> int:
-        """From which channel does audio start? Always 1 in practice.
-
-        The state has shape [B, text_channels + audio_channels, T] where text_channels=1
-        in practice, but in the future we might want to support >1.
-        """
         return 1
 
     def _get_initial_token(self) -> torch.Tensor:
@@ -318,69 +442,9 @@ class LMModel(StreamingContainer):
         audio_token = audio_token.expand(-1, self.num_audio_codebooks, -1)
         token = torch.cat([text_token, audio_token], dim=1)
         return token
-
-    def forward(
-            self, codes: torch.Tensor,
-            condition_tensors: tp.Optional[ConditionTensors] = None) -> LMOutput:
-        """Given an input tensor of codes [B, K, T] and list of conditions, returns the logits
-        along with masks indicating the valid positions at which to compute the loss.
-        The logits time steps are aligned with those in the input `code`.
-        Should only be used for training, not inference (use `LMGen` for that).
-
-        Args:
-            codes (torch.Tensor): Input codes of shape [B, K, T] with B the batch size,
-                K the number of codebooks and T the number of timesteps. When text is supported,
-                the first 'codebook' corresponds to the text, and the remaining codebooks are for the  audio.
-            condition_tensors (dict[str, ConditionType], optional): pre-computed conditioning tensors.
-        Returns:
-            LMOutput: Language model outputs, containing either text or audio logits, or both.
-                logits (torch.Tensor, or None) of shape [B, K, T, card] corresponding to the provided codes,
-                    i.e. the first item corresponds to logits to predict the first code, meaning that
-                    no additional shifting of codes and logits is required.
-                mask (torch.Tensor, or None) of shape [B, K, T], mask over valid and invalid positions.
-                    Given the specified interleaving strategies, parts of the logits and codes should
-                    not be considered as valid predictions because of invalid context.
-                text_logits (torch.Tensor, or None) of shape [B, 1, T, text_card].
-                text_mask (torch.Tensor, or None) of shape [B, 1, T], mask over the valid positions for the text.
-        """
-        B, K, T = codes.shape
-        assert K == self.num_codebooks, (K, self.num_codebooks)
-        # Delaying codes and removing the last time step that will never be an input.
-        initial = self._get_initial_token().expand(B, -1, -1)
-        delayed_codes = _delay_sequence(self.delays, codes, initial)
-        # Inserting the empty tokens for the first time step.
-        delayed_codes = torch.cat([initial, delayed_codes], dim=2)
-
-        sum_condition: torch.Tensor | None = None
-        cross_attention_src: torch.Tensor | None = None
-        if condition_tensors is None:
-            assert self.fuser is None
-        else:
-            assert self.fuser is not None
-            sum_condition = self.fuser.get_sum(condition_tensors)
-            cross_attention_src = self.fuser.get_cross(condition_tensors)
-
-        transformer_out, text_logits = self.forward_text(delayed_codes[:, :, :-1], sum_condition, cross_attention_src)
-        assert transformer_out.shape[0] == delayed_codes.shape[0]
-        assert transformer_out.shape[1] == delayed_codes.shape[2] - 1
-        logits = self.forward_depformer_training(delayed_codes[:, :, 1:], transformer_out)
-
-        # map back the logits on pattern sequence to logits on original codes: [B, K, S, card] -> [B, K, T, card]
-        # and provide the corresponding mask over invalid positions of tokens. We will with NaN values invalid positions
-        # to ensure they properly handled.
-        logits, logits_mask = _undelay_sequence(
-            self.delays[self.audio_offset:self.audio_offset + self.dep_q],
-            logits, fill_value=float('NaN'))
-        logits_mask &= (codes[:, self.audio_offset: self.audio_offset + self.dep_q] != self.zero_token_id)
-        text_logits, text_logits_mask = _undelay_sequence(self.delays[:1], text_logits, fill_value=float('NaN'))
-        text_logits_mask &= (codes[:, :1] != self.zero_token_id)
-        return LMOutput(logits, logits_mask, text_logits, text_logits_mask)
-
-    def forward_text(
-        self,
-        sequence: torch.Tensor, sum_condition: torch.Tensor | None = None,
-        cross_attention_src: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    
+    def embed_codes(self, sequence: torch.Tensor) -> torch.Tensor:
+        # Comment: Input channels (text, generated audio, input audio) are added together
         B, K, S = sequence.shape
         assert (
             K == self.num_codebooks
@@ -393,34 +457,147 @@ class LMModel(StreamingContainer):
             )
             input_ = audio_emb if input_ is None else input_ + audio_emb
         text_emb = self.text_emb(input_sequence[:, 0])
-
         input_ = text_emb if input_ is None else input_ + text_emb
-        if sum_condition is not None:
-            input_ = input_ + sum_condition.to(input_)
-        if cross_attention_src is not None:
-            cross_attention_src = cross_attention_src.to(input_)
-        transformer_out = self.transformer(input_, cross_attention_src=cross_attention_src)
+        return input_
+
+    def forward_codes(
+        self,
+        sequence: torch.Tensor,
+        return_hidden_layers: bool = False,
+        return_attention_weights: bool = False,
+        steering_vector: torch.Tensor | None = None,
+        steering_layer: int | None = None,
+        steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
+        steer_attn_only: bool = False,
+    ):
+        return self.forward_embeddings(
+            self.embed_codes(sequence),
+            return_hidden_layers=return_hidden_layers,
+            return_attention_weights=return_attention_weights,
+            steering_vector=steering_vector,
+            steering_layer=steering_layer,
+            steering_vectors_by_layer=steering_vectors_by_layer,
+            steer_attn_only=steer_attn_only,
+        )
+    
+    def forward_embeddings(
+        self,
+        input: torch.Tensor,
+        return_hidden_layers: bool = False,
+        return_attention_weights: bool = False,
+        steering_vector: torch.Tensor | None = None,
+        steering_layer: int | None = None,
+        steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
+        steer_attn_only: bool = False,
+    ) -> ForwardCodesOutput:
+        # print("EMBED:", input[0, 0, :10].float().cpu().tolist()) # DEBUG
+        if return_hidden_layers and return_attention_weights:
+            transformer_out, hidden_layers, attention_weights = self.transformer(
+                input,
+                return_hidden_layers=True,
+                return_attention_weights=True,
+                steering_vector=steering_vector,
+                steering_layer=steering_layer,
+                steering_vectors_by_layer=steering_vectors_by_layer,
+                steer_attn_only=steer_attn_only,
+            )
+        elif return_hidden_layers:
+            transformer_out, hidden_layers = self.transformer(
+                input,
+                return_hidden_layers=True,
+                steering_vector=steering_vector,
+                steering_layer=steering_layer,
+                steering_vectors_by_layer=steering_vectors_by_layer,
+                steer_attn_only=steer_attn_only,
+            )
+            attention_weights = None
+        elif return_attention_weights:
+            transformer_out, attention_weights = self.transformer(
+                input,
+                return_attention_weights=True,
+                steering_vector=steering_vector,
+                steering_layer=steering_layer,
+                steering_vectors_by_layer=steering_vectors_by_layer,
+                steer_attn_only=steer_attn_only,
+            )
+            hidden_layers = None
+        else:
+            transformer_out = self.transformer(
+                input,
+                steering_vector=steering_vector,
+                steering_layer=steering_layer,
+                steering_vectors_by_layer=steering_vectors_by_layer,
+                steer_attn_only=steer_attn_only,
+            )
+            hidden_layers = None
+            attention_weights = None
         if self.out_norm:
             transformer_out = self.out_norm(transformer_out)
         assert isinstance(transformer_out, torch.Tensor)
         text_logits = self.text_linear(transformer_out)
         text_logits = text_logits[:, None]
-        return transformer_out, text_logits
+        return ForwardCodesOutput(
+            transformer_out=transformer_out,
+            text_logits=text_logits,
+            hidden_layers=hidden_layers,
+            attention_weights=attention_weights,
+        )
+
+    def forward_depformer(
+        self,
+        depformer_cb_index: int,
+        sequence: torch.Tensor,
+        transformer_out: torch.Tensor,
+        return_hidden_layers: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, List[torch.Tensor]]:
+        B, K, S = sequence.shape
+        assert (
+            K == 1
+        ), f"Codebooks for Depformer streaming should be passed 1 by 1, got {K}."
+        assert (
+            S == 1
+        ), f"Steps for Depformer streaming should be passed 1 by 1, got {S}."
+        assert (
+            transformer_out.shape[1] == 1
+        ), "Transformer out should be a for a single step."
+        last_token_input: Optional[torch.Tensor] = None
+        depformer_input = transformer_out
+        if self.depformer_multi_linear:
+            depformer_input = self.depformer_in[depformer_cb_index](depformer_input)
+        else:
+            depformer_input = self.depformer_in[0](depformer_input)
+        if depformer_cb_index == 0:
+            last_token_input = self.depformer_text_emb(sequence[:, 0])
+        else:
+            last_token_input = self.depformer_emb[depformer_cb_index - 1](
+                sequence[:, 0]
+            )
+        depformer_input = depformer_input + last_token_input
+        assert depformer_input.shape[1] == 1
+        # depformer_input is [B, 1, depformer_dim].
+        # The streaming state of the depformer ensures that the proper layer is run.
+        if return_hidden_layers:
+            dep_output, hidden_layers = self.depformer(depformer_input, return_hidden_layers=True)
+        else:
+            dep_output = self.depformer(depformer_input)
+            hidden_layers = None
+        logits = self.linears[depformer_cb_index](dep_output)
+        logits = logits[:, None]
+        assert logits.dim() == 4, logits.shape  # [B, Ka, S, card]
+        if return_hidden_layers:
+            return logits, hidden_layers
+        return logits
 
     def forward_depformer_training(
         self,
         sequence: torch.Tensor,
         transformer_out: torch.Tensor,
     ) -> torch.Tensor:
-        assert self.depformer_text_emb
-        assert self.depformer_emb
-        assert self.depformer
-
         B, K, T = sequence.shape
         Ka = self.dep_q
         assert (
             K == self.num_codebooks
-        ), f"Codebooks for Depformer training should be passed all at once, got {K}."
+        ), f"Codebooks for Depformer training should be passed all at once, got {K,}."
         depformer_inputs = []
         for cb_index in range(Ka):
             if self.depformer_multi_linear:
@@ -441,234 +618,238 @@ class LMModel(StreamingContainer):
         depformer_output = self.depformer(depformer_input)
         all_logits = []
         for cb_index in range(Ka):
-            logits = self.linears[cb_index](self.depformer_norms[cb_index](depformer_output[:, cb_index]))
+            logits = self.linears[cb_index](depformer_output[:, cb_index])
             all_logits.append(logits.view(B, T, -1))
         logits = torch.stack(all_logits, 1)
         assert logits.dim() == 4, logits.shape  # [B, Ka, T, card]
         return logits
 
-    def forward_depformer(
-        self,
-        depformer_cb_index: int,
-        sequence: torch.Tensor,
-        transformer_out: torch.Tensor,
-    ) -> torch.Tensor:
-        assert self.depformer_text_emb is not None
-        assert self.depformer_emb is not None
-        assert self.depformer is not None
-        B, K, S = sequence.shape
-        assert (
-            K == 1
-        ), f"Codebooks for Depformer streaming should be passed 1 by 1, got {K}."
-        assert (
-            S == 1
-        ), f"Steps for Depformer streaming should be passed 1 by 1, got {S}."
-        assert (
-            transformer_out.shape[1] == 1
-        ), "Transformer out should be a for a single step."
-        last_token_input: tp.Optional[torch.Tensor] = None
-        depformer_input = transformer_out
-        if self.depformer_multi_linear:
-            in_index = depformer_cb_index
-            if self.depformer_weights_per_step_schedule is not None:
-                in_index = self.depformer_weights_per_step_schedule[in_index]
-            depformer_input = self.depformer_in[in_index](depformer_input)
-        else:
-            depformer_input = self.depformer_in[0](depformer_input)
-        if depformer_cb_index == 0:
-            last_token_input = self.depformer_text_emb(sequence[:, 0])
-        else:
-            last_token_input = self.depformer_emb[depformer_cb_index - 1](
-                sequence[:, 0]
-            )
-        assert last_token_input is not None
-        depformer_input = depformer_input + last_token_input
-        assert depformer_input.shape[1] == 1
-        # depformer_input is [B, 1, depformer_dim].
-        # The streaming state of the depformer ensures that the proper layer is run.
-        dep_output = self.depformer(depformer_input)
-        logits = self.linears[depformer_cb_index](self.depformer_norms[depformer_cb_index](dep_output))
-        logits = logits[:, None]
-        assert logits.dim() == 4, logits.shape  # [B, Ka, S, card]
-        return logits
+    def forward_train(self, codes: torch.Tensor):
+        B, K, T = codes.shape
+        # Delaying codes and removing the last time step that will never be an input.
+        initial = self._get_initial_token().expand(B, -1, -1)
+        delayed_codes = _delay_sequence(self.delays, codes, initial)
+        # Inserting the empty tokens for the first time step.
+        delayed_codes = torch.cat([initial, delayed_codes], dim=2)
 
-    def _init_weights(self):
-        """Initialization of the transformer module weights.
-        Mostly truncated gaussian, with `std = 1 / sqrt(dim_in)`.
-        Embeddings are also initialized with `1 / sqrt(dim)` rather than `1`.
-        Some layers are not going to be properly initialized:
-            - in_proj in MHA.
-            - depth transformer layers.
-        This is to match how our models were trained so far.
-        """
+        # LLM Backbone
+        backbone_out = self.forward_codes(delayed_codes[:, :, :-1])
+        transformer_out = backbone_out.transformer_out
+        text_logits = backbone_out.text_logits
+        logits = self.forward_depformer_training(delayed_codes[:, :, 1:], transformer_out)
 
-        for emb_layer in self.emb:
-            _init_layer(emb_layer)
-        if self.depformer_emb is not None:
-            for emb_layer in self.depformer_emb:
-                _init_layer(emb_layer)
-        _init_layer(self.text_emb)
-        if self.depformer_text_emb is not None:
-            _init_layer(self.depformer_text_emb)
-        _init_layer(self.text_linear)
-
-        for tr_layer in self.transformer.layers:
-            tr_layer.apply(_init_layer)
-
-        for linear in self.linears:
-            _init_layer(linear)
+        # map back the logits on pattern sequence to logits on original codes: [B, K, S, card] -> [B, K, T, card]
+        # and provide the corresponding mask over invalid positions of tokens. We will with NaN values invalid positions
+        # to ensure they properly handled.
+        logits, logits_mask = _undelay_sequence(
+            self.delays[self.audio_offset:self.audio_offset + self.dep_q],
+            logits, fill_value=float('NaN'))
+        logits_mask &= (codes[:, self.audio_offset: self.audio_offset + self.dep_q] != self.zero_token_id)
+        text_logits, text_logits_mask = _undelay_sequence(self.delays[:1], text_logits, fill_value=float('NaN'))
+        text_logits_mask &= (codes[:, :1] != self.zero_token_id)
+        return LMOutput(logits, logits_mask, text_logits, text_logits_mask)
 
 
 @dataclass
-class _LMGenState(State):
+class _LMGenState:
     cache: torch.Tensor
+    provided: torch.Tensor
     initial: torch.Tensor
     graphed_main: CUDAGraphed
-    graphed_depth: CUDAGraphed | None
-    offsets: torch.Tensor
-    offset_cpu: int = 0
-    condition_sum: torch.Tensor | None = None
-    condition_cross: torch.Tensor | None = None
-    cfg_is_masked_until: torch.Tensor | None = None
-    exit_stack: ExitStack = field(default_factory=ExitStack)
-    reset_callback: tp.Callable[[torch.Tensor], None] | None = None
-    set_exec_mask_callback: tp.Callable[[torch.Tensor], None] | None = None
+    graphed_embeddings: CUDAGraphed
+    graphed_depth: CUDAGraphed
+    offset: int = 0
 
-    def reset(self, reset_mask: torch.Tensor) -> None:
-        super().reset(reset_mask)
-        self.offsets[:] = torch.where(reset_mask, torch.zeros_like(self.offsets), self.offsets)
-        self.offset_cpu = 0
-        if self.reset_callback is not None:
-            self.reset_callback(reset_mask)
+    def reset(self):
+        self.offset = 0
+        self.provided[:] = False
 
-    def set_exec_mask(self, exec_mask: torch.Tensor):
-        super().set_exec_mask(exec_mask)
-        if self.set_exec_mask_callback is not None:
-            self.set_exec_mask_callback(exec_mask)
 
-    def __enter__(self):
-        self.exit_stack.__enter__()
+@torch.no_grad()
+def create_loss_report(
+    state_cache: torch.Tensor,
+    lm_model: LMModel,
+    text_logits: torch.Tensor,
+    audio_logits: torch.Tensor,
+    target: torch.Tensor,
+    sampled_text_token: torch.Tensor,
+    sampled_audio_tokens: torch.Tensor,
+    target_position: int,
+) -> dict[str, torch.Tensor]:
+    report = {}
+    B = state_cache.shape[0]
+    # model_tokens is the sampled output from model_logits
+    model_tokens = torch.zeros_like(state_cache[:, :, target_position])
+    model_tokens[:, 0] = sampled_text_token
+    model_tokens[:, 1 : lm_model.dep_q + 1] = sampled_audio_tokens
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.exit_stack.__exit__(exc_type, exc_value, traceback)
+    report.update(
+        {
+            "forced_tokens": torch.zeros((B, lm_model.dep_q + 1)),
+            "model_tokens": torch.zeros((B, lm_model.dep_q + 1)),
+            "ranks_of_forced": torch.zeros((B, lm_model.dep_q + 1)),
+            "losses": torch.zeros((B, lm_model.dep_q+1)),
+        }
+    )
+    report["model_tokens"] = model_tokens.clone()
+    report["forced_tokens"] = target.clone()
+
+    # Text Channel
+    text_logits = text_logits.squeeze(dim=1).squeeze(dim=1)
+    target = target[:, 0].squeeze(1).clone()
+
+    text_probs = torch.softmax(text_logits, dim=-1)
+    text_ranks = torch.argsort(text_probs, dim=-1, descending=True)
+    for b in range(B):
+        forced_token = target[b].item()
+        try:
+            rank = (text_ranks[b] == forced_token).nonzero().item()
+        except RuntimeError:
+            rank = lm_model.zero_token_id
+        report["ranks_of_forced"][b, 0] = rank
+
+    target[target == lm_model.text_initial_token_id] = -100
+    text_loss = torch.nn.functional.cross_entropy(
+        text_logits,
+        target,
+        ignore_index=-100,
+        )
+    report["losses"][:, 0] = text_loss
+
+    # Audio Channels
+    for k in range(lm_model.dep_q):
+        target = target[:, k+1].squeeze(1).clone()
+        channel_logits = audio_logits[:, k, :]
+
+        audio_probs = torch.softmax(channel_logits, dim=-1)
+        audio_ranks = torch.argsort(audio_probs, dim=-1, descending=True)
+        for b in range(B):
+            forced_token = target[b].item()
+            try:
+                rank = (audio_ranks[b] == forced_token).nonzero().item()
+            except RuntimeError:
+                rank = lm_model.zero_token_id
+            report["ranks_of_forced"][b, k + 1] = rank
+
+        target[target == lm_model.initial_token_id] = -100
+        audio_loss = torch.nn.functional.cross_entropy(
+            channel_logits,
+            target,
+            ignore_index=-100,
+        )
+        report["losses"][:, k + 1] = audio_loss
+    return report
 
 
 class LMGen(StreamingModule[_LMGenState]):
     def __init__(
         self,
         lm_model: LMModel,
+        device: str | torch.device,
         use_sampling: bool = True,
         temp: float = 0.8,
         temp_text: float = 0.7,
         top_k: int = 250,
         top_k_text: int = 25,
-        cfg_coef: float = 1.,
         check: bool = False,
-        condition_tensors: ConditionTensors | None = None,
-        on_text_hook: tp.Optional[tp.Callable[[torch.Tensor], None]] = None,
-        on_text_logits_hook: tp.Optional[tp.Callable[[torch.Tensor], None]] = None,
-        on_audio_hook: tp.Optional[tp.Callable[[torch.Tensor], None]] = None,
-        support_out_of_sync: bool = False,
-        cfg_is_masked_until: list[int] | None = None,
-        cfg_is_no_text: bool = False,
+        report_loss: bool = False,
+        return_logits: bool = False,
+        audio_silence_frame_cnt: int = 1,
+        text_prompt_tokens: Optional[list[int]] = None,
+        save_voice_prompt_embeddings: bool = False,
+        sample_rate: int = 32000,
+        frame_rate: int = FRAME_RATE_HZ,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
 
         self.lm_model = lm_model
-        self.lm_model.set_streaming_detached(True)
         self.use_sampling = use_sampling
         self.temp = temp
         self.temp_text = temp_text
         self.top_k = top_k
         self.top_k_text = top_k_text
-        self.cfg_coef = cfg_coef
+        self.text_prompt_tokens = text_prompt_tokens
+        self.audio_silence_frame_cnt = audio_silence_frame_cnt
+        self.voice_prompt = None
+        self.zero_text_code = 3
+        self._frame_rate = frame_rate
+        self._sample_rate = sample_rate
+        self._frame_size = int(self._sample_rate / self._frame_rate)
+        self._zero_frame = torch.zeros(1, 1, self._frame_size, device=device)
+        duration = self._frame_size / self._sample_rate
+        sine = create_sinewave(duration, self._sample_rate)
+        self._sine_frame = torch.tensor(sine, device=device).unsqueeze(0).unsqueeze(0)  # (1,1,T)
         self.check = check
+        self.report_loss = report_loss
+        if report_loss:
+            return_logits = True
+        self.return_logits = return_logits
         self.max_delay = max(
             lm_model.delays
         )  # with delays, we need to generate a few more time steps.
         self.delays_cuda = torch.tensor(
             lm_model.delays, device=lm_model.device, dtype=torch.long
         )
-        self.condition_tensors = condition_tensors
-        self.on_text_hook = on_text_hook
-        self.on_text_logits_hook = on_text_logits_hook
-        self.on_audio_hook = on_audio_hook
-        self.support_out_of_sync = support_out_of_sync
-        self.cfg_is_masked_until = cfg_is_masked_until
-        self.cfg_is_no_text = cfg_is_no_text
-        if self.cfg_coef != 1.:
-            if not self.cfg_is_no_text and not self.cfg_is_masked_until:
-                assert self.lm_model.fuser is not None, "Model has no fuser, cannot do CFG."
-                assert self.condition_tensors, "Missing condition tensors for CFG."
+        self.save_voice_prompt_embeddings = save_voice_prompt_embeddings
+        self.voice_prompt_audio: Optional[torch.Tensor] = None
+        self.voice_prompt_cache: Optional[torch.Tensor] = None
+        self.voice_prompt_embeddings: Optional[torch.Tensor] = None
+        #self.voice_prompt_mimi_streaming_state: Optional[StreamingStateDict] = None
+        
+        # Silence token tensor for detection (moshi audio tokens only, channels 1-8)
+        self._silence_tokens_tensor = torch.tensor(
+            SILENCE_TOKENS, dtype=torch.long, device=lm_model.device
+        )
+
+    def is_silence_token(self, tokens: torch.Tensor, threshold: int = SILENCE_TOKEN_MATCH_THRESHOLD) -> bool:
+        """Check if the generated audio tokens match silence tokens.
+        
+        Args:
+            tokens: Generated tokens of shape [B, K, T] where K includes text + audio tokens
+            threshold: Minimum number of matching tokens to be considered silence (default 6 out of 8)
+            
+        Returns:
+            True if the audio tokens match silence tokens within threshold
+        """
+        if tokens is None:
+            return False
+        # Extract audio tokens (channels 1-8, index 1:9)
+        audio_tokens = tokens[0, 1:9, 0]  # Shape: [8]
+        # Count matching tokens
+        matches = (audio_tokens == self._silence_tokens_tensor).sum().item()
+        return matches >= threshold
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
         initial = lm_model._get_initial_token()
         cache = torch.full(
-            (batch_size, self.lm_model.num_codebooks, self.max_delay + 2),
+            (batch_size, self.lm_model.num_codebooks, self.max_delay + 3),
             lm_model.ungenerated_token_id,
             device=lm_model.device,
             dtype=torch.long,
         )
-        offsets = torch.zeros(batch_size, device=lm_model.device, dtype=torch.long)
-
-        if self.lm_model.fuser is None:
-            assert not self.condition_tensors
-            condition_sum = None
-            condition_cross = None
-        else:
-            assert self.condition_tensors is not None
-            condition_sum = self.lm_model.fuser.get_sum(self.condition_tensors)
-            condition_cross = self.lm_model.fuser.get_cross(self.condition_tensors)
-            if condition_sum is not None:
-                condition_sum = condition_sum.to(self.lm_model.dtype)
-            if condition_cross is not None:
-                condition_cross = condition_cross.to(self.lm_model.dtype)
+        provided = torch.full(
+            (batch_size, self.lm_model.num_codebooks, self.max_delay + 3),
+            False,
+            device=lm_model.device,
+            dtype=torch.bool
+        )
 
         disable = lm_model.device.type != 'cuda'
-        graphed_main = CUDAGraphed(lm_model.forward_text, disable=disable)
-        if lm_model.depformer is not None:
-            graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
-        else:
-            graphed_depth = None
+        # disable = True # DEBUG
+        graphed_main = CUDAGraphed(lm_model.forward_codes, disable=disable)
+        graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable)
+        graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
 
-        if self.cfg_is_masked_until is None:
-            cfg_is_masked_until = None
-        else:
-            cfg_is_masked_until = torch.tensor(self.cfg_is_masked_until, dtype=torch.long, device=lm_model.device)
-
-        state = _LMGenState(
-            batch_size, lm_model.device, cache, initial, graphed_main, graphed_depth,
-            offsets, condition_sum=condition_sum, condition_cross=condition_cross,
-            cfg_is_masked_until=cfg_is_masked_until)
-
-        if self.cfg_coef != 1.:
-            batch_size *= 2
-            if state.condition_sum is not None:
-                assert state.condition_sum.shape[0] == batch_size, "cfg requires 2x more conditions."
-            if state.condition_cross is not None:
-                assert state.condition_cross.shape[0] == batch_size, "cfg requires 2x more conditions."
-        state.exit_stack.enter_context(self.lm_model.streaming(batch_size))
-
-        def _reset_callback(reset_mask: torch.Tensor) -> None:
-            if self.cfg_coef != 1.:
-                reset_mask = reset_mask.repeat(2)
-            self.lm_model.reset_streaming(reset_mask)
-
-        def _set_exec_mask_callback(exec_mask: torch.Tensor) -> None:
-            if self.cfg_coef != 1.:
-                exec_mask = exec_mask.repeat(2)
-            self.lm_model.set_exec_mask(exec_mask)
-
-        state.reset_callback = _reset_callback
-        state.set_exec_mask_callback = _set_exec_mask_callback
-        return state
-
+        return _LMGenState(cache, provided, initial, graphed_main, graphed_embeddings, graphed_depth)
+    
     @torch.no_grad()
-    def _step(self, input_tokens: torch.Tensor,
-              depformer_replace_tokens: torch.Tensor | None = None
-              ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    def prepare_step_input(self,
+                           input_tokens: torch.Tensor=None,
+                           moshi_tokens:torch.Tensor=None,
+                           text_token:torch.Tensor=None,
+                           ):
         state = self._streaming_state
         if state is None:
             raise RuntimeError(
@@ -676,160 +857,576 @@ class LMGen(StreamingModule[_LMGenState]):
             )
         lm_model = self.lm_model
 
-        assert input_tokens.dim() == 3, "Shape should be [B, K, T]."
-        B, Ki, S = input_tokens.shape
-        assert B == state.batch_size, f"Got a batch size {B}, expected {state.batch_size}"
-        assert S == 1, "Only support being given steps one by one."
-        needed_tokens = lm_model.num_codebooks - lm_model.dep_q - 1
-        assert (
-            Ki >= needed_tokens
-        ), f"We expect {needed_tokens} tokens from the user stream, got {Ki}."
-
-        if Ki > needed_tokens:
-            input_tokens = input_tokens[:, :needed_tokens, :]
-
+        # audio_tokens_per_stream = lm_model.dep_q//2
+        needed_tokens = lm_model.num_codebooks - AUDIO_TOKENS_PER_STREAM - 1
         CT = state.cache.shape[2]
 
-        delays = self.delays_cuda[lm_model.dep_q + 1:]
-        write_positions = (state.offsets[:, None, None] + delays[:, None]) % CT
-        scatter_with_mask_(state.cache[:, lm_model.dep_q + 1:], -1, write_positions, input_tokens,
-                           state.exec_mask[:, None, None])
+        ####
+        # Fill Cache with provided tokens at state.offset (target) + delays
 
-        is_init = state.offsets[:, None, None] <= self.delays_cuda[:, None]
-        is_init |= ~state.exec_mask[:, None, None]  # we also give init tokens if not executing to avoid crashing.
-        positions = (state.offsets % CT)[:, None, None].expand_as(is_init)
-        input_ = state.cache.gather(dim=2, index=positions)
-        input_ = torch.where(is_init, state.initial, input_)
+        if input_tokens is not None:
+            assert input_tokens.dim() == 3, "Shape should be [B, K, T]."
+            B, Ki, S = input_tokens.shape
+            assert S == 1, "Only support being given steps one by one."
+            assert (
+                Ki == needed_tokens
+            ), f"We expect {needed_tokens} tokens from the user stream, got {Ki}."
+
+            for q_other in range(input_tokens.shape[1]):
+                k = AUDIO_TOKENS_PER_STREAM + 1 + q_other
+                delay = lm_model.delays[k]
+                write_position = (state.offset + delay) % CT
+                state.cache[:, k, write_position : write_position + 1] = input_tokens[:, q_other]
+                state.provided[:, k, write_position : write_position + 1] = True
+
+        if moshi_tokens is not None:
+            assert moshi_tokens.dim() == 3, "Shape should be [B, K, T]."
+            B, Ki, S = moshi_tokens.shape
+            assert S == 1, "Only support being given steps one by one."
+            assert (
+                Ki == needed_tokens
+            ), f"We expect {needed_tokens} tokens from the moshi stream, got {Ki}."
+
+            for q_moshi in range(moshi_tokens.shape[1]):
+                k = 1 + q_moshi
+                delay = lm_model.delays[k]
+                write_position = (state.offset + delay) % CT
+                state.cache[:, k, write_position : write_position + 1] = moshi_tokens[:, q_moshi]
+                state.provided[:, k, write_position : write_position + 1] = True
+
+        if text_token is not None:
+            write_position = (state.offset + lm_model.delays[0]) % CT
+            state.cache[:, 0, write_position] = text_token
+            state.provided[:, 0, write_position] = True
+
+        for k, delay in enumerate(lm_model.delays):
+            # Only for the very beginning, we extend the initial token for the acoustic
+            # token that are delayed, and thus have no good value to take.
+            if state.offset <= delay:
+                state.cache[:, k, state.offset % CT] = state.initial[:, k, 0]
+                state.provided[:, k, state.offset % CT] = True
+
+        ####
+        # Perform inference at state.offset - 1 (model_input); forcing with tokens at state.offset (target) when provided
+
+        if state.offset == 0:
+            # We can't report loss or force depth tranformer tokens until we're at step 2
+            # And we need to initialize the delay-0 cache where it's not provided for step 2
+            state.cache[:, :, 0] = state.initial[:, :, 0] # torch.where(state.provided[:, :, 0], state.cache[:, :, 0], state.initial[:, :, 0])
+            state.offset += 1
+            return None
+
+        model_input_position = (state.offset-1) % CT
+        target_position = state.offset % CT
+        input_ = state.cache[:, :, model_input_position : model_input_position + 1]
+        target_ = state.cache[:, :, target_position : target_position + 1]
+        provided_ = state.provided[:, :, target_position : target_position + 1]
 
         if self.check:
             # Check that we are not feeding in any value that is not generated yet.
             assert not (input_ == lm_model.ungenerated_token_id).any(), (
-                state.offsets,
+                state.offset,
                 input_,
             )
             assert (input_[:, lm_model.audio_offset :] <= lm_model.card).all(), input_
             assert (input_[:, :1] <= lm_model.text_card).all()
+        return input_, provided_, target_, model_input_position, target_position
 
-        zero = torch.full((1,), self.lm_model.zero_token_id, dtype=torch.long, device=input_.device)
-        if self.cfg_coef != 1.:
-            if state.cfg_is_masked_until is not None:
-                limit = self.delays_cuda[:, None] + state.cfg_is_masked_until.view(-1, 1, 1)
-                is_zeroed = state.offsets[:, None, None] <= limit
+    @torch.no_grad()
+    def step(self, input_tokens: torch.Tensor=None, moshi_tokens:torch.Tensor=None, text_token:torch.Tensor=None,
+               return_embeddings: bool=False, return_hidden_layers: bool=False, return_attention_weights: bool=False,
+               check_silence_token: bool=False, steering_vector: torch.Tensor | None = None,
+               steering_layer: int | None = None,
+             steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
+                         steer_attn_only: bool = False,
+                         return_step_input_tokens: bool = False) \
+        -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]] | tuple[torch.Tensor, HiddenLayerOutputs] | tuple[torch.Tensor, HiddenLayerOutputs, bool]:
+        """Run a single step of the language model.
+        
+        Args:
+            input_tokens: User audio tokens
+            moshi_tokens: Moshi audio tokens  
+            text_token: Text token
+            return_embeddings: If True, return embeddings
+            return_hidden_layers: If True, return hidden layer outputs
+            return_attention_weights: If True, return text transformer attention weights
+            check_silence_token: If True, also return a boolean indicating if silence was detected
+            steering_vector: 1D steering vector for this token step. If None, no steering is applied.
+            steering_layer: Main transformer layer index where steering is injected.
+            return_step_input_tokens: If True, append model input token ids for this step
+                (shape [B, K_in, 1]) where K_in is typically 17.
+            
+        Returns:
+            Generated tokens and optionally embeddings, hidden layers, and silence detection flag
+        """
+        capture_hidden = return_hidden_layers or return_attention_weights
+        state = self._streaming_state
+        lm_model = self.lm_model
+        prepared_inputs = self.prepare_step_input(
+            input_tokens, moshi_tokens, text_token,
+        )
+        # print("INPUT:", None if input_tokens is None else input_tokens.squeeze().cpu().tolist()) # DEBUG
+        # print("MOSHI:", None if moshi_tokens is None else moshi_tokens.squeeze().cpu().tolist()) # DEBUG
+        if prepared_inputs is None:
+            requested_extras = int(return_embeddings) + int(capture_hidden) + int(check_silence_token) + int(return_step_input_tokens)
+            if requested_extras == 0:
+                return None
+            pending: list[object] = [None]
+            if return_embeddings:
+                pending.append(None)
+            if capture_hidden:
+                pending.append(None)
+            if check_silence_token:
+                pending.append(None)
+            if return_step_input_tokens:
+                pending.append(None)
+            return tuple(pending)
+        input_, provided_, target_, model_input_position, target_position = prepared_inputs
+        if self.check:
+            # Check that we are not feeding in any value that is not generated yet.
+            assert not (input_ == lm_model.ungenerated_token_id).any(), (
+                state.offset,
+                input_,
+            )
+            assert (input_[:, lm_model.audio_offset :] <= lm_model.card).all(), input_
+            assert (input_[:, :1] <= lm_model.text_card).all()
+        
+        embeddings = None
+        if return_embeddings:
+            embeddings = self.lm_model.embed_codes(input_)
 
-                masked = torch.where(is_zeroed & ~is_init, zero, input_)
-                input_ = torch.cat([input_, masked], dim=0)
+        do_steer = steering_vector is not None
+        do_multi_steer = steering_vectors_by_layer is not None and len(steering_vectors_by_layer) > 0
+        if do_steer and do_multi_steer:
+            raise ValueError("Provide either steering_vector/steering_layer or steering_vectors_by_layer, not both")
+        if do_steer:
+            if steering_layer is None:
+                raise ValueError("steering_vector provided but steering_layer is None")
+        
+        # Hidden/attention requests bypass graphed_main so we can return requested internals.
+        if capture_hidden:
+            forward_out = lm_model.forward_codes(
+                input_,
+                return_hidden_layers=return_hidden_layers,
+                return_attention_weights=return_attention_weights,
+                steering_vector=steering_vector,
+                steering_layer=steering_layer,
+                steering_vectors_by_layer=steering_vectors_by_layer,
+                steer_attn_only=steer_attn_only,
+            )
+            transformer_out = forward_out.transformer_out
+            text_logits = forward_out.text_logits
+            text_hidden_layers = forward_out.hidden_layers
+            text_attention_weights = forward_out.attention_weights
+        else:
+            if do_steer:
+                forward_out = lm_model.forward_codes(
+                    input_,
+                    steering_vector=steering_vector,
+                    steering_layer=steering_layer,
+                    steering_vectors_by_layer=steering_vectors_by_layer,
+                    steer_attn_only=steer_attn_only,
+                )
+                transformer_out = forward_out.transformer_out
+                text_logits = forward_out.text_logits
+            elif do_multi_steer:
+                forward_out = lm_model.forward_codes(
+                    input_,
+                    steering_vectors_by_layer=steering_vectors_by_layer,
+                    steer_attn_only=steer_attn_only,
+                )
+                transformer_out = forward_out.transformer_out
+                text_logits = forward_out.text_logits
             else:
-                input_ = input_.repeat(2, 1, 1)
-            if self.cfg_is_no_text:
-                input_[B:, :1] = torch.where(~is_init[:, :1], zero, input_[B:, :1])
+                forward_out = state.graphed_main(input_)
+                transformer_out = forward_out.transformer_out
+                text_logits = forward_out.text_logits
+            text_hidden_layers = forward_out.hidden_layers
+            text_attention_weights = forward_out.attention_weights
 
-        transformer_out, text_logits = state.graphed_main(input_, state.condition_sum, state.condition_cross)
-        if self.cfg_coef != 1.:
-            logits, logits_null = text_logits.chunk(2)
-            if self.cfg_is_no_text:
-                text_logits = logits
+        # Process transformer output and get depth hidden layers if requested
+        if capture_hidden:
+            output_result = self.process_transformer_output(
+                transformer_out,
+                text_logits,
+                provided_,
+                target_,
+                model_input_position,
+                target_position,
+                return_hidden_layers=capture_hidden,
+            )
+            # Handle variable return structure from process_transformer_output
+            if self.report_loss:
+                output, report, depth_hidden_layers = output_result
+            elif self.return_logits and not self.report_loss:
+                output, logits_tuple, depth_hidden_layers = output_result
             else:
-                text_logits = logits_null + (logits - logits_null) * self.cfg_coef
+                output, depth_hidden_layers = output_result
+            
+            # Create combined hidden layer outputs
+            combined_hidden_layers = HiddenLayerOutputs(
+                text_transformer=text_hidden_layers,  # The text transformer hidden layers for this step
+                text_attention_weights=text_attention_weights,
+                text_pre_unembed=transformer_out,
+                depth_transformer=depth_hidden_layers # The depth_hidden_layers is a list of hidden transformer layers for each acoustic token in this step
+            )
+        else:
+            output = self.process_transformer_output(
+                transformer_out,
+                text_logits,
+                provided_,
+                target_,
+                model_input_position,
+                target_position,
+            )
+            combined_hidden_layers = None
+        
+        # Build return value based on what was requested
+        returns = [output]
+        if return_embeddings:
+            returns.append(embeddings)
+        if capture_hidden:
+            returns.append(combined_hidden_layers)
+        if check_silence_token:
+            is_silence = self.is_silence_token(output)
+            returns.append(is_silence)
+        if return_step_input_tokens:
+            returns.append(input_)
+            
+        if len(returns) == 1:
+            return returns[0]
+        else:
+            return tuple(returns)
+    
+    @torch.no_grad()
+    def step_embeddings(self, embeddings: torch.Tensor):
+        state = self._streaming_state
+        lm_model = self.lm_model
+        needed_input_tokens = lm_model.num_codebooks - AUDIO_TOKENS_PER_STREAM - 1
+        _dummy_audio_token = lm_model._get_initial_token()
+        while True:
+            prepared_inputs = self.prepare_step_input(
+                input_tokens=_dummy_audio_token[:, 1:1+needed_input_tokens], moshi_tokens=_dummy_audio_token[:, 1+needed_input_tokens:], text_token=self.zero_text_code,
+            )
+            if prepared_inputs is not None:
+                break
+        _, provided_, target_, model_input_position, target_position = prepared_inputs
+        forward_out = state.graphed_embeddings(embeddings)
+        transformer_out = forward_out.transformer_out
+        text_logits = forward_out.text_logits
+        return self.process_transformer_output(
+            transformer_out,
+            text_logits,
+            provided_,
+            target_,
+            model_input_position,
+            target_position,
+        )
+
+    @torch.no_grad()
+    def process_transformer_output(self, transformer_out, text_logits, provided_, target_, model_input_position, target_position, return_hidden_layers=False):
+        state = self._streaming_state
+        lm_model = self.lm_model
+
         # Shape of text_logits should be [B, K_text=1, T=1, Card_text]
-        if self.on_text_logits_hook:
-            self.on_text_logits_hook(text_logits)
-        text_token = sample_token(
+        sampled_text_token = sample_token(
             text_logits.float(),
             self.use_sampling,
             self.temp_text,
             self.top_k_text,
         )
-        assert text_token.dim() == 3, text_token.shape
-        assert text_token.shape[2] == 1
-        assert text_token.shape[1] == 1, "Only one text stream supported."
-        text_token = text_token[:, 0, 0]  # shape is [B]
-        if self.on_text_hook is not None:
-            self.on_text_hook(text_token)
-        if state.graphed_depth is None:
-            audio_tokens = None
-        else:
-            if depformer_replace_tokens is None:
-                audio_tokens = state.graphed_depth(text_token, transformer_out)
-            else:
-                assert depformer_replace_tokens.dim() == 3
-                audio_tokens = depformer_replace_tokens.squeeze(-1)
-            if self.on_audio_hook is not None:
-                self.on_audio_hook(audio_tokens)
+        assert sampled_text_token.dim() == 3, sampled_text_token.shape
+        assert sampled_text_token.shape[2] == 1
+        assert sampled_text_token.shape[1] == 1, "Only one text stream supported."
+        sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
 
-        state.offsets = torch.where(state.exec_mask, state.offsets + 1, state.offsets)
-        state.offset_cpu += 1
-        positions = (state.offsets % CT)[:, None, None]
-        scatter_with_mask_(state.cache[:, :1], -1, positions,
-                           text_token[:, None, None], state.exec_mask[:, None, None])
-        if audio_tokens is not None:
-            audio_tokens = audio_tokens[:, :, None]
-            scatter_with_mask_(
-                state.cache[:, 1 : lm_model.dep_q + 1, :],
-                -1,
-                positions.expand_as(audio_tokens),
-                audio_tokens,
-                state.exec_mask[:, None, None],
+        next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
+
+        depth_hidden_layers = None
+        if return_hidden_layers:
+            # Bypass graphed version to extract hidden layers
+            if self.return_logits:
+                sampled_audio_tokens, audio_logits, depth_hidden_layers = self.depformer_step(
+                    next_text_token, transformer_out, 
+                    target_[:,lm_model.audio_offset:,0], 
+                    provided_[:,lm_model.audio_offset:,0], 
+                    return_hidden_layers=True
+                ) 
+            else:
+                sampled_audio_tokens, depth_hidden_layers = self.depformer_step(
+                    next_text_token, transformer_out, 
+                    target_[:,lm_model.audio_offset:,0], 
+                    provided_[:,lm_model.audio_offset:,0], 
+                    return_hidden_layers=True
+                )
+                audio_logits = None
+        else:
+            # Use graphed version for performance
+            if self.return_logits:
+                sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]
+            else:
+                sampled_audio_tokens = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0])
+                audio_logits = None
+
+        state.provided[:, :, model_input_position] = False
+        ####
+        # Fill cache with generated tokens at state.offset (where not provided)
+
+        state.cache[:, 0, target_position] = torch.where(
+            ~state.provided[:, 0, target_position],
+            sampled_text_token,
+            state.cache[:, 0, target_position],
+        )
+        state.cache[:, 1 : lm_model.dep_q + 1, target_position] = torch.where(
+            ~state.provided[:, 1 : lm_model.dep_q + 1, target_position],
+            sampled_audio_tokens,
+            state.cache[:, 1 : lm_model.dep_q + 1, target_position],
+        )
+
+        ####
+        # Calculate loss of model logits (based on state.offset - 1) compared to target (state.offset)
+
+        report = {}
+        if self.report_loss:
+            report = create_loss_report(
+                state_cache=state.cache,
+                lm_model=lm_model,
+                text_logits=text_logits,
+                audio_logits=audio_logits,
+                target=target_,
+                sampled_text_token=sampled_text_token,
+                sampled_audio_tokens=sampled_audio_tokens,
+                target_position=target_position,
             )
 
-        if not self.support_out_of_sync and state.offset_cpu <= self.max_delay:
-            # When using out of sync exec, should not rely on this being None.
-            return None
+        ####
+        # Collect outputs for state.offset - max_delay
+
+        if state.offset <= self.max_delay:
+            state.offset += 1
+            if self.report_loss:
+                return (None, report, depth_hidden_layers) if return_hidden_layers else (None, report)
+            if self.return_logits:
+                return (None, None, depth_hidden_layers) if return_hidden_layers else (None, None)
+            else:
+                return (None, depth_hidden_layers) if return_hidden_layers else None
+        
         B = state.cache.shape[0]
+        CT = state.cache.shape[2]
         gen_delays_cuda = self.delays_cuda[: lm_model.dep_q + 1]
-        index = (state.offsets[:, None, None] - self.max_delay + gen_delays_cuda[:, None]) % CT
+        index = (
+            ((state.offset - self.max_delay + gen_delays_cuda) % CT)
+            .view(1, -1, 1)
+            .expand(B, -1, 1)
+        )
         out = state.cache.gather(dim=2, index=index)
-        mask = (state.offsets <= self.max_delay) | ~state.exec_mask
-        out[mask, :, :] = lm_model.ungenerated_token_id
-        return out, transformer_out
 
-    @torch.no_grad()
-    def step(self, input_tokens: torch.Tensor,
-             depformer_replace_tokens: torch.Tensor | None = None) -> torch.Tensor | None:
-        out = self._step(input_tokens, depformer_replace_tokens)
-        if out is None:
-            return None
-        return out[0]
+        state.offset += 1
+        if self.report_loss:
+            return (out, report, depth_hidden_layers) if return_hidden_layers else (out, report)
+        elif self.return_logits and not self.report_loss:
+            return (out, (text_logits.clone(), audio_logits.clone() if audio_logits is not None else None), depth_hidden_layers) if return_hidden_layers else (out, (text_logits.clone(), audio_logits.clone() if audio_logits is not None else None))
+        else:
+            return (out, depth_hidden_layers) if return_hidden_layers else out
 
-    @torch.no_grad()
-    def step_with_extra_heads(
-        self,
-        input_tokens: torch.Tensor,
-        depformer_replace_tokens: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
-        out = self._step(input_tokens, depformer_replace_tokens)
-        if out is None:
-            return None
-        out, transformer_out = out
-        extra_heads = [
-            torch.nn.functional.softmax(extra_head(transformer_out), dim=-1)
-            for extra_head in self.lm_model.extra_heads
-        ]
-        return out, extra_heads
+    def load_voice_prompt(self, voice_prompt: str):
+        self.voice_prompt = voice_prompt
+        raw_audio = load_audio(
+            voice_prompt, self._sample_rate,
+        )  # shape: (1, T) for mono
+
+        # Normalize to -24 LUFS (mono-safe)
+        raw_audio = normalize_audio(raw_audio, self._sample_rate, -24.0)
+
+        # Keep shape (1, T) because your encoder expects channels-first
+        if raw_audio.ndim == 1:
+            raw_audio = raw_audio[None, :]
+
+        self.voice_prompt_audio = raw_audio
+        self.voice_prompt_cache: Optional[torch.Tensor] = None
+        self.voice_prompt_embeddings: Optional[torch.Tensor] = None
+
+    def load_voice_prompt_embeddings(self, path: str):
+        self.voice_prompt = path
+        state = torch.load(path)
+
+        self.voice_prompt_audio = None
+        self.voice_prompt_embeddings = state["embeddings"].to(self.lm_model.device)
+        self.voice_prompt_cache = state["cache"].to(self.lm_model.device)
+
+    def _encode_zero_frame(self) -> torch.Tensor:
+        return torch.as_tensor(
+            SILENCE_TOKENS,
+            dtype=torch.long,
+            device=self.lm_model.device,
+        ).view(1, 8, 1)
+
+    def _encode_sine_frame(self) -> torch.Tensor:
+        return torch.as_tensor(
+            SINE_TOKENS,
+            dtype=torch.long,
+            device=self.lm_model.device,
+        ).view(1, 8, 1)
+
+    def _encode_voice_prompt_frames(self, mimi):
+        return encode_from_sphn(
+            mimi,
+            _iterate_audio(
+                self.voice_prompt_audio,
+                sample_interval_size=self._frame_size,
+                pad=True,
+            ),
+            max_batch=1,
+        )
+
+    def _step_voice_prompt_frame(self,
+                                 voice_prompt_frame_tokens: torch.Tensor,
+                                 saved_embeddings: Optional[list[torch.Tensor]]=None,
+                                 ):
+        # Always use zero_text_code during voice prompt
+        out = self.step(
+            moshi_tokens=voice_prompt_frame_tokens,
+            text_token=self.zero_text_code,
+            input_tokens=self._encode_sine_frame(),
+            return_embeddings=self.save_voice_prompt_embeddings,
+        )
+        if out is not None and self.save_voice_prompt_embeddings:
+            _, embeddings = out
+            saved_embeddings.append(embeddings)
+
+    def _step_voice_prompt_core(self, mimi) -> Iterator[None]:
+        """Shared core for stepping through the voice prompt.
+
+        This generator yields at each *checkpoint* where the async wrapper may want to
+        consult `is_alive`. The core itself is intentionally unaware of connection state.
+        """
+        if self.voice_prompt_embeddings is not None:
+            # Replay stored voice prompt embeddings
+            for next_embed in self.voice_prompt_embeddings:
+                yield
+                self.step_embeddings(next_embed)
+
+            state = self._streaming_state
+            state.cache.copy_(self.voice_prompt_cache)
+            return
+
+        elif self.voice_prompt_audio is not None:
+            saved_embeddings = []
+            for voice_prompt_frame_tokens in self._encode_voice_prompt_frames(mimi):
+                yield
+                self._step_voice_prompt_frame(
+                    voice_prompt_frame_tokens,
+                    saved_embeddings
+                )
+            # One last checkpoint before any optional save (nice-to-have for async disconnect)
+            yield
+
+            if self.save_voice_prompt_embeddings:
+                # Offset int(self._streaming_state.offset) is not needed since calling step() for len(voice_prompt_frame_tokens)
+                # and calling step_embeddings() for len(voice_prompt_embeddings) will increment offset by the same amount
+                torch.save(
+                    {
+                        "embeddings": torch.stack(saved_embeddings, dim=0).detach().cpu(),
+                        "cache": self._streaming_state.cache
+                    },
+                    splitext(self.voice_prompt)[0] + ".pt",
+                )
+        print('Done loading voice prompt.')
+
+    def _step_voice_prompt(self, mimi):
+        # Sync path intentionally does not support `is_alive` / disconnect checks.
+        for _ in self._step_voice_prompt_core(mimi):
+            pass
+
+    async def _step_voice_prompt_async(self, mimi, is_alive: Optional[Callable]=None):
+        for _ in self._step_voice_prompt_core(mimi):
+            if is_alive is not None and not await is_alive():
+                break
+
+    def _step_audio_silence_core(self) -> Iterator[None]:
+        # For slots of silence (default 0.5s) after voice/text prompts
+        # (agent text, user audio, agent audio) : (PADs, silence, sine)
+        for _ in range(self.audio_silence_frame_cnt):
+            yield
+            self.step(
+                moshi_tokens=self._encode_zero_frame(),
+                text_token=self.zero_text_code,
+                input_tokens=self._encode_sine_frame(),
+            )
+        print('Done loading audio silence.')
+
+    def _step_audio_silence(self):
+        # Sync path intentionally does not support `is_alive` / disconnect checks.
+        for _ in self._step_audio_silence_core():
+            pass
+
+    async def _step_audio_silence_async(self, is_alive: Optional[Callable]=None):
+        for _ in self._step_audio_silence_core():
+            if is_alive is not None and not await is_alive():
+                break
+
+    def _step_text_prompt_core(self) -> Iterator[None]:
+        for text_prompt_token in self.text_prompt_tokens:
+            yield
+            self.step(
+                moshi_tokens=self._encode_zero_frame(),
+                text_token=text_prompt_token,
+                input_tokens=self._encode_sine_frame(),
+            )
+        print('Done loading text prompt.')
+
+
+    def _step_text_prompt(self):
+        # Sync path intentionally does not support `is_alive` / disconnect checks.
+        for _ in self._step_text_prompt_core():
+            pass
+
+    async def _step_text_prompt_async(self, is_alive: Optional[Callable]=None):
+        for _ in self._step_text_prompt_core():
+            if is_alive is not None and not await is_alive():
+                break
+
+    async def step_system_prompts_async(self, mimi, is_alive: Optional[Callable]=None):
+        await self._step_voice_prompt_async(mimi, is_alive)
+        await self._step_audio_silence_async(is_alive)
+        await self._step_text_prompt_async(is_alive)
+        await self._step_audio_silence_async(is_alive)
+
+    def step_system_prompts(self, mimi):
+        self._step_voice_prompt(mimi)
+        self._step_audio_silence()
+        self._step_text_prompt()
+        self._step_audio_silence()
 
     def depformer_step(
         self,
         text_token: torch.Tensor,
         transformer_out: torch.Tensor,
-    ) -> torch.Tensor:
-        B, = text_token.shape
-        B_cfg = B
-        if self.cfg_coef != 1.:
-            B_cfg = 2 * B
+        audio_tokens: torch.Tensor,
+        audio_provided: torch.Tensor,
+        return_hidden_layers: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, List[torch.Tensor]]:
+        (B,) = text_token.shape
         prev_token = text_token
         lm_model = self.lm_model
         depformer_tokens: list[torch.Tensor] = []
-        assert lm_model.depformer
+        depformer_logits: list[torch.Tensor] = []
+        all_hidden_layers: list[torch.Tensor] = [] if return_hidden_layers else None
         assert not lm_model.depformer.is_streaming
-        with lm_model.depformer.streaming(B_cfg):
-            assert lm_model.depformer.is_streaming
+        with lm_model.depformer.streaming(B):
             for cb_index in range(lm_model.dep_q):
                 input_ = prev_token[:, None, None]
-                if self.cfg_coef != 1.:
-                    input_ = input_.repeat(2, 1, 1)
-                logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
-                if self.cfg_coef != 1.:
-                    logits, logits_null = logits.chunk(2)
-                    logits = logits_null + (logits - logits_null) * self.cfg_coef
+                if return_hidden_layers:
+                    logits, hidden_layers = lm_model.forward_depformer(cb_index, input_, transformer_out, return_hidden_layers=True)
+                    # Accumulate hidden layers from all codebook steps
+                    all_hidden_layers.append(hidden_layers)
+                else:
+                    logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
+                if self.return_logits:
+                    assert logits.shape == (B, 1, 1, lm_model.card), logits.shape
+                    ret_logits = logits.squeeze(dim=1).squeeze(dim=1)
+                    assert ret_logits.shape == (B, lm_model.card), ret_logits.shape
+                    depformer_logits.append(ret_logits.float())
                 next_token = sample_token(
                     logits.float(),
                     self.use_sampling,
@@ -838,13 +1435,30 @@ class LMGen(StreamingModule[_LMGenState]):
                 )
                 assert next_token.shape == (B, 1, 1)
                 next_token = next_token[:, 0, 0]  # shape is B
+                prev_token = torch.where(
+                    audio_provided[:, cb_index],
+                    audio_tokens[:, cb_index],
+                    next_token,
+                )
                 depformer_tokens.append(next_token)
-                prev_token = next_token
 
         assert len(depformer_tokens) == lm_model.dep_q, (
             len(depformer_tokens),
             lm_model.dep_q,
         )
-        out = torch.stack(depformer_tokens, dim=1)
-        assert out.shape == (B, lm_model.dep_q), out.shape
-        return out
+        tokens = torch.stack(depformer_tokens, dim=1)
+        assert tokens.shape == (B, lm_model.dep_q), tokens.shape
+        
+        if self.return_logits and return_hidden_layers:
+            all_logits = torch.stack(depformer_logits, dim=1)
+            assert all_logits.shape == (B, lm_model.dep_q, lm_model.card), all_logits.shape
+            return tokens, all_logits, all_hidden_layers
+        elif self.return_logits:
+            all_logits = torch.stack(depformer_logits, dim=1)
+            assert all_logits.shape == (B, lm_model.dep_q, lm_model.card), all_logits.shape
+            return tokens, all_logits
+        elif return_hidden_layers:
+            return tokens, all_hidden_layers
+        else:
+            return tokens
+
