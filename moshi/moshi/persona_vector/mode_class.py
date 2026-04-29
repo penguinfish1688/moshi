@@ -119,12 +119,50 @@ def _build_labels(
     return labels
 
 
+def _build_mode_masks(
+    num_tokens: int,
+    listening_ranges: List[List[int]],
+    speaking_ranges: List[List[int]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build explicit listening/speaking boolean masks from ranges.
+
+    Unlike ``_build_labels``, tokens outside both sets are left unlabeled and
+    excluded from downstream aggregation.
+    """
+    listening_mask = torch.zeros(num_tokens, dtype=torch.bool)
+    speaking_mask = torch.zeros(num_tokens, dtype=torch.bool)
+
+    for start, end in listening_ranges:
+        if start < 0 or end >= num_tokens:
+            raise ValueError(
+                f"Listening range [{start}, {end}] out of bounds "
+                f"for {num_tokens} tokens."
+            )
+        listening_mask[start : end + 1] = True
+
+    for start, end in speaking_ranges:
+        if start < 0 or end >= num_tokens:
+            raise ValueError(
+                f"Speaking range [{start}, {end}] out of bounds "
+                f"for {num_tokens} tokens."
+            )
+        speaking_mask[start : end + 1] = True
+
+    return listening_mask, speaking_mask
+
+
 def _derive_output_paths(hidden_path: str) -> tuple[str, str]:
     """Derive output wav / text paths from a hidden payload path.
 
-    ``complete_sentence_hidden.pt`` → ``complete_sentence_output.wav``,
-    ``complete_sentence_output.json``.
+    ``output_hidden.pt`` → ``output.wav``, ``output.json``.
+
+    For legacy names, falls back to ``<prefix>_output.wav/json`` where
+    ``prefix`` is the hidden filename without ``_hidden.pt``.
     """
+    if hidden_path.endswith("output_hidden.pt"):
+        root = hidden_path[: -len("output_hidden.pt")]
+        return root + "output.wav", root + "output.json"
+
     base = hidden_path.replace("_hidden.pt", "")
     return base + "_output.wav", base + "_output.json"
 
@@ -243,10 +281,8 @@ class HiddenExtractor:
     def class_mode_dataset(self, dataset_path: str) -> None:
         """Generate hidden payloads for every entry in a mode-class dataset.
 
-        Expects ``dataset_path/<id>/complete_sentence.wav`` and
-        ``dataset_path/<id>/incomplete_sentence.wav`` to exist (produced by
-        TTS).  Outputs ``complete_sentence_hidden.pt`` and
-        ``incomplete_sentence_hidden.pt`` next to each WAV.
+        Expects ``dataset_path/<id>/input.wav`` to exist (produced by TTS).
+        Outputs ``output_hidden.pt`` next to the WAV.
 
         Already-existing hidden files are skipped.
         """
@@ -265,19 +301,18 @@ class HiddenExtractor:
 
         for entry_json in entries:
             entry_dir = os.path.dirname(entry_json)
-            for prefix in ("complete_sentence", "incomplete_sentence"):
-                wav = os.path.join(entry_dir, f"{prefix}.wav")
-                hidden = os.path.join(entry_dir, f"{prefix}_hidden.pt")
-                if not os.path.exists(wav):
-                    raise FileNotFoundError(
-                        f"Expected WAV not found: {wav}. "
-                        "Run TTS (--mode-class) first."
-                    )
-                if os.path.exists(hidden):
-                    print(f"[SKIP] {hidden} already exists")
-                    continue
-                input_wavs.append(wav)
-                output_hiddens.append(hidden)
+            wav = os.path.join(entry_dir, "input.wav")
+            hidden = os.path.join(entry_dir, "output_hidden.pt")
+            if not os.path.exists(wav):
+                raise FileNotFoundError(
+                    f"Expected WAV not found: {wav}. "
+                    "Run TTS (--mode-class) first."
+                )
+            if os.path.exists(hidden):
+                print(f"[SKIP] {hidden} already exists")
+                continue
+            input_wavs.append(wav)
+            output_hiddens.append(hidden)
 
         if not input_wavs:
             print(
@@ -323,12 +358,8 @@ class HiddenModeClassifier:
 
         For each entry under ``dataset_path/<id>/``:
 
-        * ``complete_sentence_hidden.pt`` is labeled using the
-          ``complete_modes.listening`` / ``complete_modes.speaking`` ranges
-          from ``input.json``.
-        * ``incomplete_sentence_hidden.pt`` is labeled using the
-          ``incomplete_modes.listening`` / ``incomplete_modes.speaking``
-          ranges from ``input.json``.
+                * ``output_hidden.pt`` is labeled using
+                    ``modes.listening`` / ``modes.speaking`` ranges from ``input.json``.
 
         Saves the trained model to
         ``output_dir/hidden_mode_classifier_layer_{layer}.pt``.
@@ -353,55 +384,29 @@ class HiddenModeClassifier:
             with open(entry_json, "r", encoding="utf-8") as f:
                 meta = json.load(f)
 
-            # ---- complete_sentence_hidden --------------------------------
-            cs_path = os.path.join(entry_dir, "complete_sentence_hidden.pt")
-            if not os.path.exists(cs_path):
+            # ---- output_hidden -------------------------------------------
+            output_hidden_path = os.path.join(entry_dir, "output_hidden.pt")
+            if not os.path.exists(output_hidden_path):
                 raise FileNotFoundError(
-                    f"Missing {cs_path}. "
+                    f"Missing {output_hidden_path}. "
                     "Run --gen-dataset-hidden first."
                 )
 
-            if "complete_modes" not in meta:
+            if "modes" not in meta:
                 raise KeyError(
                     f"input.json for entry {entry_id} is missing "
-                    "'complete_modes' label ranges."
+                    "'modes' label ranges."
                 )
-            cs_modes = meta["complete_modes"]
+            modes = meta["modes"]
 
-            cs_payload = _load_hidden_payload(cs_path)
-            cs_hidden = _extract_layer(cs_payload, layer)  # [T, D]
-            T_cs = cs_hidden.shape[0]
-            cs_labels = _build_labels(
-                T_cs, cs_modes["listening"], cs_modes["speaking"]
+            output_payload = _load_hidden_payload(output_hidden_path)
+            output_hidden = _extract_layer(output_payload, layer)  # [T, D]
+            T_output = output_hidden.shape[0]
+            output_labels = _build_labels(
+                T_output, modes["listening"], modes["speaking"]
             )
-            all_hiddens.append(cs_hidden)
-            all_labels.append(cs_labels)
-
-            # ---- incomplete_sentence_hidden ------------------------------
-            is_path = os.path.join(
-                entry_dir, "incomplete_sentence_hidden.pt"
-            )
-            if not os.path.exists(is_path):
-                raise FileNotFoundError(
-                    f"Missing {is_path}. "
-                    "Run --gen-dataset-hidden first."
-                )
-
-            if "incomplete_modes" not in meta:
-                raise KeyError(
-                    f"input.json for entry {entry_id} is missing "
-                    "'incomplete_modes' label ranges."
-                )
-            is_modes = meta["incomplete_modes"]
-
-            is_payload = _load_hidden_payload(is_path)
-            is_hidden = _extract_layer(is_payload, layer)  # [T, D]
-            T_is = is_hidden.shape[0]
-            is_labels = _build_labels(
-                T_is, is_modes["listening"], is_modes["speaking"]
-            )
-            all_hiddens.append(is_hidden)
-            all_labels.append(is_labels)
+            all_hiddens.append(output_hidden)
+            all_labels.append(output_labels)
 
         # Aggregate all tokens
         X = torch.cat(all_hiddens, dim=0)  # [N, D]
@@ -610,8 +615,7 @@ def save_mean_hidden_diff(root_dir: str, output_path: Optional[str] = None) -> s
     """Compute per-layer speaking/listening mean-hidden difference.
 
     Reads ``root_dir/*/input.json`` and matching hidden payload files:
-      - ``complete_sentence_hidden.pt`` with ``complete_modes`` labels
-      - ``incomplete_sentence_hidden.pt`` with ``incomplete_modes`` labels
+            - ``output_hidden.pt`` with ``modes`` labels
 
     For each layer ``l``, computes:
       ``mean_speaking(l) - mean_listening(l)``
@@ -640,10 +644,7 @@ def save_mean_hidden_diff(root_dir: str, output_path: Optional[str] = None) -> s
         with open(entry_json, "r", encoding="utf-8") as f:
             meta = json.load(f)
 
-        sample_specs = [
-            ("complete_sentence_hidden.pt", "complete_modes"),
-            ("incomplete_sentence_hidden.pt", "incomplete_modes"),
-        ]
+        sample_specs = [("output_hidden.pt", "modes")]
 
         for hidden_name, mode_key in sample_specs:
             hidden_path = os.path.join(entry_dir, hidden_name)
@@ -671,14 +672,11 @@ def save_mean_hidden_diff(root_dir: str, output_path: Optional[str] = None) -> s
                 )
 
             num_tokens = int(hidden.shape[0])
-            labels = _build_labels(
+            listening_mask, speaking_mask = _build_mode_masks(
                 num_tokens,
                 modes["listening"],
                 modes["speaking"],
             )
-
-            speaking_mask = labels == 1
-            listening_mask = labels == 0
 
             if int(speaking_mask.sum()) > 0:
                 speak_chunk = hidden[speaking_mask].sum(dim=0).detach().cpu()  # [L, D]
@@ -755,8 +753,8 @@ def plot_prediction(
     * **X-axis**: token index.  Each tick is labeled with the decoded
       token name from the hidden payload (``token_names``).
     * **User transcript lane**: if a sibling ``input.json`` exists next
-      to *hidden_path*, its ``complete_sentence`` / ``incomplete_sentence``
-      is shown as a text band below the plot.
+            to *hidden_path*, its ``input`` field is shown as a text band below
+            the plot.
 
     Args:
         prediction_path: JSON file produced by ``HiddenModeClassifier.predict``.
@@ -796,13 +794,13 @@ def plot_prediction(
     token_names = token_names[:num_tokens]
 
     # ---- user transcript from sibling transcript JSON -------------------------
-    # For mode_class files like complete_sentence_hidden.pt -> complete_sentence.json
+    # For mode_class files like output_hidden.pt -> output.json
     # For other datasets like output_hidden.pt -> try output.json, fall back to input.json
     # Expected format: {"text": "...", "chunks": [{"text": "word", "timestamp": [start, end]}, ...]}
     hidden_p = Path(hidden_path)
-    stem = hidden_p.stem  # e.g. "complete_sentence_hidden"
-    # Strip "_hidden" suffix to get the sentence prefix
-    transcript_prefix = stem.replace("_hidden", "")  # "complete_sentence"
+    stem = hidden_p.stem  # e.g. "output_hidden"
+    # Strip "_hidden" suffix to get the transcript prefix
+    transcript_prefix = stem.replace("_hidden", "")  # "output"
 
     # Candidate transcript files: derived name first, then input.json as fallback
     candidates = [hidden_p.parent / f"{transcript_prefix}.json"]
@@ -1102,7 +1100,7 @@ def plot_prediction_dataset(
     print(f"[plot-dataset] Found {len(hidden_files)} hidden files under {root}")
 
     for hp in hidden_files:
-        stem = hp.stem  # e.g. "complete_sentence_hidden"
+        stem = hp.stem  # e.g. "output_hidden"
         pred_json = hp.with_name(f"{stem}_prediction.json")
         plot_png = hp.with_name(f"{stem}_mode_prediction.png")
 
@@ -1575,6 +1573,7 @@ def plot_attention_by_subseqent_token_heatmap(
     import numpy as np
 
     root = Path(root_dir)
+    log_prefix = "[plot-attn-subseq]"
     if not root.is_dir():
         raise FileNotFoundError(f"Root directory not found: {root}")
     if span < 1:
@@ -1585,6 +1584,11 @@ def plot_attention_by_subseqent_token_heatmap(
     sample_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
     if not sample_dirs:
         raise FileNotFoundError(f"No sample directories found under {root}")
+    print(
+        f"{log_prefix} Scanning {len(sample_dirs)} sample dirs under {root} "
+        f"(span={span}, future_query_window={window})",
+        flush=True,
+    )
 
     def _jsonable_2d(arr: np.ndarray) -> List[List[Optional[float]]]:
         out: List[List[Optional[float]]] = []
@@ -1621,32 +1625,67 @@ def plot_attention_by_subseqent_token_heatmap(
     # Collect per-sample anchored matrices for plotting: [L, span+1]
     sample_maps: List[np.ndarray] = []
     num_layers_ref: Optional[int] = None
+    skipped = 0
 
-    for sd in sample_dirs:
+    for sample_idx, sd in enumerate(sample_dirs, start=1):
         timing_path = sd / "input_timing.json"
         hidden_path = sd / "output_hidden.pt"
         if not hidden_path.exists():
             hidden_path = sd / "output_hidden"
         if not timing_path.is_file() or not hidden_path.is_file():
+            skipped += 1
+            print(
+                f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                "missing input_timing.json or output_hidden(.pt)",
+                flush=True,
+            )
             continue
 
         try:
+            print(
+                f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] Loading {sd.name}",
+                flush=True,
+            )
             with timing_path.open("r", encoding="utf-8") as f:
                 timing = json.load(f)
             if not isinstance(timing, dict) or "interrupt_start" not in timing:
+                skipped += 1
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                    "input_timing.json missing interrupt_start",
+                    flush=True,
+                )
                 continue
 
             payload = _load_hidden_payload(str(hidden_path))
             frame_rate_hz = float(payload.get("frame_rate", 12.5))
             anchor_tok = int(round(float(timing["interrupt_start"]) * frame_rate_hz))
             if anchor_tok < 0:
+                skipped += 1
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                    f"negative anchor token {anchor_tok}",
+                    flush=True,
+                )
                 continue
 
             attn_steps = payload.get("text_attention_weights", None)
             if not isinstance(attn_steps, list) or len(attn_steps) == 0:
+                skipped += 1
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                    "missing non-empty text_attention_weights",
+                    flush=True,
+                )
                 continue
             first_attn = next((a for a in attn_steps if isinstance(a, torch.Tensor)), None)
             if first_attn is None or first_attn.ndim != 3:
+                skipped += 1
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                    "no valid attention tensor",
+                    flush=True,
+                )
                 continue
 
             L = int(first_attn.shape[0])
@@ -1654,13 +1693,35 @@ def plot_attention_by_subseqent_token_heatmap(
                 num_layers_ref = L
             elif num_layers_ref != L:
                 # Keep a consistent layer dimension across samples.
+                skipped += 1
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                    f"layer count {L} != reference {num_layers_ref}",
+                    flush=True,
+                )
                 continue
 
             T = len(attn_steps)
+            print(
+                f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] Calculating {sd.name}: "
+                f"layers={L}, steps={T}, anchor_token={anchor_tok}, "
+                f"frame_rate={frame_rate_hz:g}Hz",
+                flush=True,
+            )
             # Full conversation values for this sample: [L, T].
             local_all_tokens = np.full((L, T), np.nan, dtype=np.float32)
             for l in range(L):
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] "
+                    f"Layer {l + 1}/{L}: building attention matrix",
+                    flush=True,
+                )
                 mat = _build_attn_prob_matrix(payload, l)  # [T, T]
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] "
+                    f"Layer {l + 1}/{L}: averaging future attention",
+                    flush=True,
+                )
                 for t in range(T):
                     if t >= T - 1:
                         continue
@@ -1700,7 +1761,19 @@ def plot_attention_by_subseqent_token_heatmap(
                 json.dump(per_sample_json, f, indent=2, ensure_ascii=False)
 
             sample_maps.append(local)
-        except Exception:
+            finite_count = int(np.isfinite(local_all_tokens).sum())
+            print(
+                f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] Done {sd.name}: "
+                f"finite_cells={finite_count}/{local_all_tokens.size}, wrote {per_sample_out}",
+                flush=True,
+            )
+        except Exception as exc:
+            skipped += 1
+            print(
+                f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
             continue
 
     if not sample_maps:
@@ -1708,6 +1781,11 @@ def plot_attention_by_subseqent_token_heatmap(
             "No valid samples found with input_timing.json (interrupt_start) and output_hidden(.pt)."
         )
 
+    print(
+        f"{log_prefix} Aggregating {len(sample_maps)} valid samples "
+        f"({skipped} skipped)",
+        flush=True,
+    )
     heat = np.nanmean(np.stack(sample_maps, axis=0), axis=0)  # [L, span+1]
     L = int(heat.shape[0])
 
@@ -1747,7 +1825,7 @@ def plot_attention_by_subseqent_token_heatmap(
     fig.tight_layout()
     fig.savefig(out_png, bbox_inches="tight")
     plt.close(fig)
-    print(f"[plot-attn-subseq] Saved {out_png}")
+    print(f"{log_prefix} Saved {out_png}", flush=True)
 
 def plot_logit_lens_step_n(
     hidden_path: str,
@@ -1758,20 +1836,22 @@ def plot_logit_lens_step_n(
     ma_window: int = 5,
     ce_json_path: Optional[str] = None,
     save_plot: bool = True,
+    use_all_codebook: bool = False,
 ) -> None:
-    """Plot step-n premature-decode CE losses and aligned waveforms.
+    """Plot step-n premature-decode probabilities and aligned waveforms.
 
     Top subplot:
-            - User Multi-modal CE (shifted): logits from step n vs user targets at step n+1
-                i.e. (CE_audio_user_shift + CE_text_user_shift) / 2
-    - Model Multi-modal CE: (CE_audio_model + CE_text_model) / 2
+      - User audio probability (shifted): logits from step n vs user audio
+        targets at step n+1, using codebook 0 by default or averaging across
+        all audio codebooks when ``use_all_codebook`` is set.
+      - Model probability: average of model text probability and model audio
+        probability, with the same audio codebook selection.
 
     Bottom subplot:
       - input.wav and output.wav amplitudes over physical time.
     """
     import matplotlib.pyplot as plt
     import numpy as np
-    import torch.nn.functional as F
 
     payload = _load_hidden_payload(hidden_path)
     frame_rate_hz = float(payload.get("frame_rate", 12.5))
@@ -1796,7 +1876,7 @@ def plot_logit_lens_step_n(
 
     T, num_layers, d_hidden = hidden.shape
     if T < 2:
-        raise ValueError("Need at least 2 token steps to compute user n+1 shifted CE.")
+        raise ValueError("Need at least 2 token steps to compute user n+1 shifted probability.")
     if input_token_ids.shape[0] != T or output_token_ids.shape[0] != T:
         raise ValueError(
             "Token-length mismatch across hidden/token-id tensors: "
@@ -1810,20 +1890,44 @@ def plot_logit_lens_step_n(
     # Expected token layout:
     # input_token_ids: [text(0), model_audio(1..8), user_audio(9..16)]
     # output_token_ids: [text(0), model_audio(1..8)]
-    if input_token_ids.shape[1] < 10:
+    input_audio_width = int(input_token_ids.shape[1]) - 1
+    output_audio_width_raw = int(output_token_ids.shape[1]) - 1
+    if input_audio_width >= 2 and input_audio_width % 2 == 0:
+        # Personaplex duplex payloads store text + model-audio + user-audio.
+        output_audio_width = input_audio_width // 2
+        user_audio_width = input_audio_width // 2
+    else:
+        # Legacy payloads may store output_token_ids as text + model-audio only.
+        output_audio_width = output_audio_width_raw
+        user_audio_width = input_audio_width - output_audio_width
+    dep_q = int(getattr(lm, "dep_q", output_audio_width))
+    num_audio_codebooks = min(output_audio_width, user_audio_width, dep_q)
+    if num_audio_codebooks <= 0:
         raise ValueError(
-            f"input_token_ids width too small ({input_token_ids.shape[1]}), expected >=10 for user audio cb0 at index 9."
+            "Unable to infer audio codebook layout from token IDs: "
+            f"input_width={input_token_ids.shape[1]}, output_width={output_token_ids.shape[1]}, "
+            f"lm_dep_q={getattr(lm, 'dep_q', None)}, input_audio_width={input_audio_width}, "
+            f"output_audio_width_raw={output_audio_width_raw}"
         )
-    if output_token_ids.shape[1] < 2:
+    user_audio_start = 1 + output_audio_width
+    if input_token_ids.shape[1] < user_audio_start + num_audio_codebooks:
         raise ValueError(
-            f"output_token_ids width too small ({output_token_ids.shape[1]}), expected >=2 for model audio cb0 at index 1."
+            f"input_token_ids width too small ({input_token_ids.shape[1]}), "
+            f"expected >= {user_audio_start + num_audio_codebooks} for "
+            f"{num_audio_codebooks} user audio codebooks after {output_audio_width} model audio codebooks."
+        )
+    if output_token_ids.shape[1] < 1 + num_audio_codebooks:
+        raise ValueError(
+            f"output_token_ids width too small ({output_token_ids.shape[1]}), "
+            f"expected >= {1 + num_audio_codebooks} for {num_audio_codebooks} model audio codebooks."
         )
 
     h_l = hidden[:, actual_layer, :]  # [T, D]
     text_tokens = output_token_ids[:, 0]  # [T], used to condition depformer audio decode.
-    user_audio_target = input_token_ids[:, 9]  # first user-audio codebook
-    model_audio_target = output_token_ids[:, 1]  # first model-audio codebook
-    user_text_target = input_token_ids[:, 0]
+    user_audio_targets = input_token_ids[
+        :, user_audio_start : user_audio_start + num_audio_codebooks
+    ]  # [T, K_audio]
+    model_audio_targets = output_token_ids[:, 1 : 1 + num_audio_codebooks]  # [T, K_audio]
     model_text_target = output_token_ids[:, 0]
 
     device = lm.device
@@ -1836,59 +1940,74 @@ def plot_logit_lens_step_n(
         # Premature text logits directly from the text decode head.
         text_logits = lm.text_linear(x)[:, 0, :].float()  # [T, text_card(+pad)]
 
-        dep_in = text_tokens.to(device=device, dtype=torch.long)[:, None, None]  # [T,1,1]
-        # First audio codebook decode head logits.
-        with lm.depformer.streaming(T):
-            logits0 = lm.forward_depformer(0, dep_in, x)  # [T, 1, 1, card]
-        logits0 = logits0[:, 0, 0, :].float()  # [T, card]
-
-        def _ce_from_probs(logits_2d: torch.Tensor, target_1d: torch.Tensor) -> torch.Tensor:
+        def _prob_from_logits(logits_2d: torch.Tensor, target_1d: torch.Tensor) -> torch.Tensor:
             probs = torch.softmax(logits_2d, dim=-1)
-            return F.nll_loss(
-                torch.log(probs.clamp_min(1e-12)),
-                target_1d,
-                reduction="none",
-            )
+            return probs.gather(1, target_1d.unsqueeze(1)).squeeze(1)
 
-        # User-focus CE is shifted by +1 target step: compare probs(n) with user_target(n+1).
-        user_audio_ce = _ce_from_probs(
-            logits0[:-1],
-            user_audio_target[1:].to(device=device, dtype=torch.long),
-        )
+        def _audio_prob_for_codebooks(audio_targets_tk: torch.Tensor) -> torch.Tensor:
+            steps = int(audio_targets_tk.shape[0])
+            if steps <= 0:
+                return torch.empty((0,), device=device, dtype=torch.float32)
 
-        # Model-focus CE remains step-aligned with n on the same valid plotted range [0..T-2].
-        model_audio_ce = _ce_from_probs(
-            logits0[:-1],
-            model_audio_target[:-1].to(device=device, dtype=torch.long),
-        )
+            x_steps = x[:-1]
+            prev_token = text_tokens[:-1].to(device=device, dtype=torch.long)[:, None, None]
+            cb_probs: list[torch.Tensor] = []
+            num_selected_codebooks = num_audio_codebooks if use_all_codebook else 1
+            with lm.depformer.streaming(steps):
+                for cb_idx in range(num_selected_codebooks):
+                    logits = lm.forward_depformer(cb_idx, prev_token, x_steps)
+                    logits = logits[:, 0, 0, :].float()
+                    target = audio_targets_tk[:, cb_idx].to(device=device, dtype=torch.long)
+                    cb_probs.append(_prob_from_logits(logits, target))
+                    prev_token = target[:, None, None]
+            return torch.stack(cb_probs, dim=0).mean(dim=0)
 
-        user_text_ce = _ce_from_probs(
-            text_logits[:-1],
-            user_text_target[1:].to(device=device, dtype=torch.long),
-        )
-        model_text_ce = _ce_from_probs(
+        # User-focus probability is shifted by +1 target step: compare probs(n)
+        # with user audio targets at n+1.
+        user_audio_prob = _audio_prob_for_codebooks(user_audio_targets[1:])
+
+        # Model-focus probability remains step-aligned with n on the same valid
+        # plotted range [0..T-2].
+        model_audio_prob = _audio_prob_for_codebooks(model_audio_targets[:-1])
+
+        model_text_prob = _prob_from_logits(
             text_logits[:-1],
             model_text_target[:-1].to(device=device, dtype=torch.long),
         )
 
-        ce_user = 0.5 * (user_audio_ce + user_text_ce)
-        ce_model = 0.5 * (model_audio_ce + model_text_ce)
+        user_prob = user_audio_prob
+        model_prob = 0.5 * (model_audio_prob + model_text_prob)
 
-    ce_user_s = ce_user.detach().cpu().float()
-    ce_model_s = ce_model.detach().cpu().float()
-    ratio = ce_user_s / ce_model_s.clamp_min(1e-6)
+    user_prob_s = user_prob.detach().cpu().float()
+    model_prob_s = model_prob.detach().cpu().float()
+    ratio = user_prob_s / model_prob_s.clamp_min(1e-12)
 
     if ce_json_path is not None:
         ce_payload = {
-            "line1_user_multimodal_ce": ce_user_s.tolist(),
-            "line2_model_multimodal_ce": ce_model_s.tolist(),
+            "line1_user_prob": user_prob_s.tolist(),
+            "line2_model_prob": model_prob_s.tolist(),
             "ratio_line1_over_line2": ratio.tolist(),
             "line1_shift": "n_to_n_plus_1",
             "line2_shift": "n_to_n",
+            "line1_mode": (
+                "avg(user_audio_all_codebooks)"
+                if use_all_codebook
+                else "user_audio_cb0"
+            ),
+            "line2_mode": (
+                "avg(model_text,avg(model_audio_all_codebooks))"
+                if use_all_codebook
+                else "avg(model_text,model_audio_cb0)"
+            ),
+            "metric": "probability",
+            "audio_codebook_mode": "all" if use_all_codebook else "first",
+            "audio_codebooks": int(num_audio_codebooks if use_all_codebook else 1),
+            "audio_codebooks_available": int(num_audio_codebooks),
+            "audio_codebooks_used": int(num_audio_codebooks if use_all_codebook else 1),
             "moving_average_window": 1,
             "smoothing": "none",
             "layer": int(layer),
-            "num_points": int(ce_user_s.shape[0]),
+            "num_points": int(user_prob_s.shape[0]),
         }
         ce_out = Path(ce_json_path)
         ce_out.parent.mkdir(parents=True, exist_ok=True)
@@ -1932,11 +2051,11 @@ def plot_logit_lens_step_n(
         ratio_np,
         color="#1f77b4",
         linewidth=1.2,
-        label="CE ratio: line1/line2 (raw)",
+        label="Probability ratio: line1/line2 (raw)",
     )
-    ax_top.set_ylabel("CE ratio")
+    ax_top.set_ylabel("Probability ratio")
     ax_top.set_title(
-        f"Logit Lens CE Ratio line1/line2 (layer={layer}, tokens={T})"
+        f"Logit Lens Probability Ratio line1/line2 (layer={layer}, tokens={T})"
     )
     y_all = ratio_np[np.isfinite(ratio_np)]
     if y_all.size > 0:
@@ -1978,8 +2097,7 @@ def plot_logit_lens_step_n(
     fig.tight_layout()
     fig.savefig(out_p, bbox_inches="tight")
     plt.close(fig)
-    print(f"[plot] Saved logit-lens CE plot to {output_path}")
-
+    print(f"[plot] Saved logit-lens probability plot to {output_path}")
 
 def plot_logit_lens_dataset(
     root_dir: str,
@@ -1989,10 +2107,11 @@ def plot_logit_lens_dataset(
     moshi_weight: Optional[str] = None,
     device: str = "cuda",
     ma_window: int = 5,
+    use_all_codebook: bool = False,
 ) -> None:
-    """Find ``root_dir/*/output_hidden(.pt)`` and plot logit-lens CE for each.
+    """Find ``root_dir/*/output_hidden(.pt)`` and save logit-lens probabilities.
 
-    If ``layer == -1``, generates plots/CE JSON for all available layers.
+    If ``layer == -1``, generates probability JSON for all available layers.
     Otherwise only the specified layer is processed.
     """
     root = Path(root_dir)
@@ -2056,6 +2175,7 @@ def plot_logit_lens_dataset(
                     ma_window=ma_window,
                     ce_json_path=str(out_json),
                     save_plot=False,
+                    use_all_codebook=use_all_codebook,
                 )
                 ok += 1
         except Exception as exc:
@@ -2064,12 +2184,33 @@ def plot_logit_lens_dataset(
     print(f"\n[plot-logit-lens] Done. Generated {ok}/{total_jobs} plots.")
 
 
+def _saved_logit_lens_prob_lines(data: Dict[str, Any]) -> tuple["np.ndarray", "np.ndarray"]:
+    """Return saved line1/line2 probabilities from the current JSON schema."""
+    import numpy as np
+
+    if "line1_user_prob" not in data or "line2_model_prob" not in data:
+        raise ValueError(
+            "Saved logit-lens JSON must use current probability fields: "
+            "line1_user_prob and line2_model_prob"
+        )
+
+    line1 = np.asarray(data.get("line1_user_prob", []), dtype=np.float32)
+    line2 = np.asarray(data.get("line2_model_prob", []), dtype=np.float32)
+
+    if line1.ndim != 1 or line2.ndim != 1:
+        raise ValueError("Saved logit-lens line arrays must be 1D")
+    if line1.shape[0] == 0 or line2.shape[0] == 0:
+        raise ValueError("Saved logit-lens line arrays are empty")
+    n = min(line1.shape[0], line2.shape[0])
+    return line1[:n], line2[:n]
+
+
 def plot_logit_lens_turn_taking_from_saved(
     root_dirs: List[str],
     *,
     span: int = 50,
 ) -> None:
-    """Average saved logit-lens CE traces around turn-taking anchors.
+    """Average saved logit-lens probability traces around turn-taking anchors.
 
     Reads ``<root>/*/in_out_ce_*.json`` and ``<root>/*/input_timing.json`` for
     each root in ``root_dirs``. For each layer and anchor
@@ -2109,9 +2250,6 @@ def plot_logit_lens_turn_taking_from_saved(
             suffix = stem.replace("in_out_ce_", "", 1)
             if suffix.lstrip("-").isdigit():
                 layer_files[int(suffix)] = p
-        legacy = sample_dir / "in_out_ce.json"
-        if legacy.is_file() and -1 not in layer_files:
-            layer_files[-1] = legacy
         return layer_files
 
     def _collect_per_root(
@@ -2169,27 +2307,14 @@ def plot_logit_lens_turn_taking_from_saved(
                     if not isinstance(ce_data, dict):
                         continue
 
-                    line1 = np.asarray(
-                        ce_data.get("line1_user_multimodal_ce", []), dtype=np.float32
-                    )
-                    line2 = np.asarray(
-                        ce_data.get("line2_model_multimodal_ce", []), dtype=np.float32
-                    )
-                    ratio = np.asarray(
-                        ce_data.get("ratio_line1_over_line2", []), dtype=np.float32
-                    )
-                    if line1.ndim != 1 or line2.ndim != 1:
+                    try:
+                        line1, line2 = _saved_logit_lens_prob_lines(ce_data)
+                    except ValueError:
                         continue
-                    if line1.shape[0] == 0 or line2.shape[0] == 0:
-                        continue
-
                     n = min(line1.shape[0], line2.shape[0])
                     line1 = line1[:n]
                     line2 = line2[:n]
-                    if ratio.ndim == 1 and ratio.shape[0] >= n:
-                        ratio = ratio[:n]
-                    else:
-                        ratio = line1 / np.clip(line2, 1e-6, None)
+                    ratio = line1 / np.clip(line2, 1e-12, None)
 
                     bucket = per_layer.setdefault(
                         int(layer_val),
@@ -2289,9 +2414,7 @@ def plot_logit_lens_turn_taking_from_saved(
         missing: list[str] = []
         for sd in sample_dirs:
             has_timing = (sd / "input_timing.json").is_file()
-            has_ce = (sd / "in_out_ce.json").is_file() or any(
-                sd.glob("in_out_ce_*.json")
-            )
+            has_ce = any(sd.glob("in_out_ce_*.json"))
             if has_timing and has_ce:
                 valid_ids.add(sd.name)
             else:
@@ -2315,7 +2438,7 @@ def plot_logit_lens_turn_taking_from_saved(
     if not common_ids:
         raise FileNotFoundError(
             "No shared valid subdirectories across provided roots. "
-            "Need subdirs that exist with both input_timing.json and in_out_ce.json in every dataset root."
+            "Need subdirs that exist with both input_timing.json and current in_out_ce_*.json files in every dataset root."
         )
 
     # Warn about subdirs excluded because they are not present/valid in all roots.
@@ -2353,7 +2476,7 @@ def plot_logit_lens_turn_taking_from_saved(
     if not per_root:
         raise FileNotFoundError(
             "No valid aligned samples found across provided root directories. "
-            "Expected each root to contain subdirs with input_timing.json and in_out_ce.json."
+            "Expected each root to contain subdirs with input_timing.json and current in_out_ce_*.json files."
         )
 
     rel_tok = np.arange(-span, span + 1, dtype=np.int32)
@@ -2420,19 +2543,19 @@ def plot_logit_lens_turn_taking_from_saved(
 
                 merged_json["datasets"][ds_name] = {
                     "num_samples": n_samples,
-                    "avg_line1_user_multimodal_ce": avg_line1.tolist(),
-                    "avg_line2_model_multimodal_ce": avg_line2.tolist(),
+                    "avg_line1_user_prob": avg_line1.tolist(),
+                    "avg_line2_model_prob": avg_line2.tolist(),
                     "avg_ratio_line1_over_line2": (
-                        (avg_line1 / np.clip(avg_line2, 1e-6, None)).tolist()
+                        (avg_line1 / np.clip(avg_line2, 1e-12, None)).tolist()
                     ),
                     "num_samples_input_audio": n_input,
                     "avg_input_audio_abs_amplitude": avg_input_amp.tolist(),
                 }
 
             ax_top.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
-            ax_top.set_ylabel("CE ratio")
+            ax_top.set_ylabel("Probability ratio")
             ax_top.set_title(
-                f"Average Logit-Lens CE Ratio Around {anchor} (layer={layer_val}, window=+/-{span})"
+                f"Average Logit-Lens Probability Ratio Around {anchor} (layer={layer_val}, window=+/-{span})"
             )
             ax_top.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
             ax_top.legend(loc="upper right", fontsize=8)
@@ -2490,34 +2613,204 @@ def plot_logit_lens_turn_taking_from_saved(
             print(f"[plot-logit-turn] Saved {out_json}")
 
 
-def logit_lens_heatmap(root_dir) -> None:
+def plot_layerwise_turn_transition_heatmap(
+    heatmap,
+    token_offsets,
+    output_path_prefix,
+    vmin=None,
+    vmax=None,
+    title: str = "Layer-wise Perception Score Around Turn Transition",
+    colorbar_label: str = r"$\mathcal{S}_\text{per}$",
+    cmap: str = "coolwarm_soft_sat",
+) -> tuple[Path, Path]:
+    """Save a publication-quality layer-vs-token-offset heatmap.
+
+    Example:
+        >>> heatmap = np.random.randn(32, 71)
+        >>> token_offsets = np.arange(-35, 36)
+        >>> plot_layerwise_turn_transition_heatmap(
+        ...     heatmap,
+        ...     token_offsets,
+        ...     "figures/perception_score",
+        ...     vmin=shared_vmin,
+        ...     vmax=shared_vmax,
+        ... )
+        >>> plot_layerwise_turn_transition_heatmap(
+        ...     heatmap,
+        ...     token_offsets,
+        ...     "figures/generation_score",
+        ...     vmin=shared_vmin,
+        ...     vmax=shared_vmax,
+        ...     title="Layer-wise Generation Score Around Turn Transition",
+        ...     colorbar_label=r"$\mathcal{S}_\text{gen}$",
+        ... )
     """
-    For root dir look for
-    logit_lens_turn_taking_layer_{layer}_interrupt_start_user_interrupt_ce.json
-    and logit_lens_turn_taking_layer_{layer}_question_start_user_question_ce.json
-    for each layer 0-31 (raise error if not all 32 layers found).
+    import matplotlib
 
-    There should be four plot two for question_start and two for interrupt_start
-    for each CE type (user_interrupt_ce and user_question_ce).
-    One heatmap is for listening mode CE and the other is for speaking mode CE (i'm not sure which is which (line1 or line2)) remember to show in the plot
-    For each plot, the y axis should be the layer number (0-31) and the x axis should be the relative token index (-span to +span).
-
-    The color scale for for each heatmap should be consistent across all layers
-    decide the scale based on the 5th and 95th percentile to be 95% saturated of blue and 95% staturated for red
-    the percentlie is calcuted from  10th to 20th layers as endpoints layers has some outliers.
-
-    Note: input JSON stores CE/NLL values, but this plot visualizes log-likelihood
-    by negating those values before rendering.
-    """
+    matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
     import numpy as np
     from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib import ticker as mticker
+
+    mat = np.asarray(heatmap, dtype=np.float32)
+    offsets = np.asarray(token_offsets)
+    if mat.ndim != 2:
+        raise ValueError(f"heatmap must be 2D, got shape {mat.shape}")
+    if offsets.ndim != 1:
+        raise ValueError(f"token_offsets must be 1D, got shape {offsets.shape}")
+    if mat.shape[1] != offsets.shape[0]:
+        raise ValueError(
+            "heatmap width must match token_offsets length: "
+            f"{mat.shape[1]} vs {offsets.shape[0]}"
+        )
+
+    finite = mat[np.isfinite(mat)]
+    if finite.size == 0:
+        raise ValueError("heatmap contains no finite values")
+    if vmin is None or vmax is None:
+        auto_vmin = float(np.percentile(finite, 15.0))
+        auto_vmax = float(np.percentile(finite, 85.0))
+        if auto_vmax <= auto_vmin:
+            auto_vmax = auto_vmin + 1e-6
+        if vmin is None:
+            vmin = auto_vmin
+        if vmax is None:
+            vmax = auto_vmax
+    if float(vmax) <= float(vmin):
+        vmax = float(vmin) + 1e-6
+
+    if offsets.shape[0] > 1:
+        step = float(np.nanmedian(np.diff(offsets.astype(np.float64))))
+        if not np.isfinite(step) or step == 0.0:
+            step = 1.0
+    else:
+        step = 1.0
+    x_left = float(offsets[0]) - 0.5 * abs(step)
+    x_right = float(offsets[-1]) + 0.5 * abs(step)
+
+    if cmap == "coolwarm_soft_sat":
+        base = plt.get_cmap("coolwarm")
+        cmap = LinearSegmentedColormap.from_list(
+            "coolwarm_soft_sat",
+            base(np.linspace(0.025, 0.975, 256)),
+        )
+
+    fig, ax = plt.subplots(figsize=(11.0, 6.5), dpi=180)
+    img = ax.imshow(
+        mat,
+        aspect="auto",
+        interpolation="nearest",
+        origin="lower",
+        cmap=cmap,
+        vmin=float(vmin),
+        vmax=float(vmax),
+        extent=(x_left, x_right, -0.5, mat.shape[0] - 0.5),
+    )
+
+    ax.axvline(0, color="black", linestyle="--", linewidth=1.0, alpha=0.8)
+    ax.set_title(title, fontsize=15)
+    ax.set_xlabel("Token offset from turn boundary", fontsize=13)
+    ax.set_ylabel("Transformer layer", fontsize=13)
+    ax.tick_params(axis="both", labelsize=11)
+    ax.set_xlim(x_left, x_right)
+    ax.set_ylim(-0.5, mat.shape[0] - 0.5)
+
+    x_locator = mticker.MaxNLocator(nbins=8, integer=True)
+    x_ticks = [
+        t
+        for t in x_locator.tick_values(float(offsets[0]), float(offsets[-1]))
+        if x_left <= t <= x_right
+    ]
+    if float(offsets[0]) <= 0.0 <= float(offsets[-1]) and not any(
+        abs(t) < 1e-9 for t in x_ticks
+    ):
+        x_ticks.append(0.0)
+    ax.set_xticks(sorted(set(float(t) for t in x_ticks)))
+
+    ax.set_yticks(np.arange(mat.shape[0]))
+
+    cbar = fig.colorbar(img, ax=ax, pad=0.02)
+    cbar.set_label(colorbar_label, fontsize=13)
+    cbar.ax.tick_params(labelsize=11)
+
+    prefix = Path(output_path_prefix)
+    if prefix.suffix:
+        prefix = prefix.with_suffix("")
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    pdf_path = prefix.with_suffix(".pdf")
+    png_path = prefix.with_suffix(".png")
+    fig.tight_layout()
+    fig.savefig(pdf_path, bbox_inches="tight")
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return pdf_path, png_path
+
+
+def plot_generation_score_heatmap(
+    heatmap,
+    token_offsets,
+    output_path_prefix,
+    vmin=None,
+    vmax=None,
+    title: str = "Layer-wise Generation Score Around Turn Transition",
+) -> tuple[Path, Path]:
+    """Save a paper-quality generation-score heatmap.
+
+    Example:
+        >>> plot_generation_score_heatmap(
+        ...     generation_heatmap,
+        ...     np.arange(-35, 36),
+        ...     "figures/generation_score",
+        ...     vmin=shared_vmin,
+        ...     vmax=shared_vmax,
+        ... )
+    """
+    return plot_layerwise_turn_transition_heatmap(
+        heatmap=heatmap,
+        token_offsets=token_offsets,
+        output_path_prefix=output_path_prefix,
+        vmin=vmin,
+        vmax=vmax,
+        title=title,
+        colorbar_label=r"$\mathcal{S}_\text{gen}$",
+    )
+
+
+def logit_lens_heatmap(
+    root_dir,
+    sper_title: str = "Layer-wise Perception Score Around Turn Transition",
+    sgen_title: str = "Layer-wise Generation Score Around Turn Transition",
+) -> None:
+    """
+    For root dir look for
+    logit_lens_turn_taking_layer_{layer}_interrupt_start_user_interrupt_prob.json
+    and logit_lens_turn_taking_layer_{layer}_question_start_user_question_prob.json
+    for each layer 0-31 (raise error if not all 32 layers found).
+
+    Supports four anchors from input_timing.json and generates plots only for
+    anchors that exist in data; missing anchors are skipped. One heatmap is for
+    perception score and the other is for generation score.
+    For each plot, the y axis should be the layer number (0-31) and the x axis should be the relative token index (-span to +span).
+
+    The color scale is shared across all related heatmaps for each score type
+    using 15th and 85th percentiles.
+
+    Note: input JSON must store current probability values
+    (line1_user_prob/line2_model_prob). This saves log-score heatmaps.
+    """
+    import numpy as np
 
     root = Path(root_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Root directory not found: {root}")
 
-    anchors = ["question_start", "interrupt_start"]
+    preferred_anchors = [
+        "question_start",
+        "question_end",
+        "interrupt_start",
+        "interrupt_end",
+    ]
     layers = list(range(32))
     frame_rate_hz = 12.5
     span = 35
@@ -2541,11 +2834,13 @@ def logit_lens_heatmap(root_dir) -> None:
 
     # line1/line2 windows gathered by anchor and layer.
     bucket: Dict[str, Dict[str, Dict[int, List[np.ndarray]]]] = {
-        "line1": {a: {lv: [] for lv in layers} for a in anchors},
-        "line2": {a: {lv: [] for lv in layers} for a in anchors},
+        "line1": {a: {lv: [] for lv in layers} for a in preferred_anchors},
+        "line2": {a: {lv: [] for lv in layers} for a in preferred_anchors},
     }
 
     used_samples = 0
+    missing_anchor_samples = 0
+    missing_ce_samples = 0
     for sd in sample_dirs:
         timing_path = sd / "input_timing.json"
         if not timing_path.is_file():
@@ -2557,13 +2852,15 @@ def logit_lens_heatmap(root_dir) -> None:
             if not isinstance(timing, dict):
                 continue
 
-            # Require both anchors for a consistent 4-plot output.
-            if any(a not in timing for a in anchors):
+            sample_anchors = [a for a in preferred_anchors if a in timing]
+            if not sample_anchors:
+                missing_anchor_samples += 1
                 continue
 
-            # Must have all 32 per-layer CE JSONs in this sample directory.
+            # Must have all 32 per-layer probability JSONs in this sample directory.
             ce_paths = {lv: sd / f"in_out_ce_{lv}.json" for lv in layers}
             if any(not p.is_file() for p in ce_paths.values()):
+                missing_ce_samples += 1
                 continue
 
             per_layer_line1: Dict[int, np.ndarray] = {}
@@ -2575,9 +2872,9 @@ def logit_lens_heatmap(root_dir) -> None:
                 if not isinstance(ce, dict):
                     ok = False
                     break
-                l1 = np.asarray(ce.get("line1_user_multimodal_ce", []), dtype=np.float32)
-                l2 = np.asarray(ce.get("line2_model_multimodal_ce", []), dtype=np.float32)
-                if l1.ndim != 1 or l2.ndim != 1 or l1.size == 0 or l2.size == 0:
+                try:
+                    l1, l2 = _saved_logit_lens_prob_lines(ce)
+                except ValueError:
                     ok = False
                     break
                 n = min(l1.shape[0], l2.shape[0])
@@ -2587,7 +2884,7 @@ def logit_lens_heatmap(root_dir) -> None:
             if not ok:
                 continue
 
-            for anchor in anchors:
+            for anchor in sample_anchors:
                 center_tok = int(round(float(timing[anchor]) * frame_rate_hz))
                 if center_tok < 0:
                     continue
@@ -2605,7 +2902,23 @@ def logit_lens_heatmap(root_dir) -> None:
 
     if used_samples == 0:
         raise FileNotFoundError(
-            "No valid samples found. Need root_dir/*/ with input_timing.json and in_out_ce_0..31.json."
+            "No valid samples found. Need root_dir/*/ with input_timing.json "
+            "(question_start/question_end/interrupt_start/interrupt_end) and "
+            "in_out_ce_0..31.json. "
+            f"Skipped due to missing anchors: {missing_anchor_samples}, "
+            f"missing probability layer files: {missing_ce_samples}."
+        )
+
+    anchors = [
+        a
+        for a in preferred_anchors
+        if any(len(bucket["line1"][a][lv]) > 0 for lv in layers)
+    ]
+    if not anchors:
+        raise FileNotFoundError(
+            "No usable anchor data found after loading samples. "
+            "Ensure input_timing.json contains at least one of: "
+            "question_start, question_end, interrupt_start, interrupt_end."
         )
 
     # Ensure all 32 layers were gathered for each anchor/line pair.
@@ -2618,76 +2931,76 @@ def logit_lens_heatmap(root_dir) -> None:
                     "Need all 32 layers (0..31)."
                 )
 
-    def _build_heat(which: str, anchor: str) -> np.ndarray:
+    def _build_heat(which: str, anchor: str, *, use_log: bool) -> np.ndarray:
         rows: List[np.ndarray] = []
         for lv in layers:
             stack = np.stack(bucket[which][anchor][lv], axis=0)
+            if use_log:
+                stack = np.log(np.clip(stack, 1e-12, None))
             rows.append(np.nanmean(stack, axis=0))
         return np.stack(rows, axis=0).astype(np.float32)
 
-    def _get_scale_bounds(mat: np.ndarray) -> tuple[float, float]:
-        # Use middle layers (10..20) to reduce endpoint outlier impact.
-        vals = mat[10:21, :]
+    def _get_shared_scale_bounds(mats: List[np.ndarray]) -> tuple[float, float]:
+        finite_parts = [m[np.isfinite(m)] for m in mats if np.isfinite(m).any()]
+        if not finite_parts:
+            return 0.0, 1.0
+        vals = np.concatenate(finite_parts)
         finite = vals[np.isfinite(vals)]
         if finite.size == 0:
-            finite = mat[np.isfinite(mat)]
-        if finite.size == 0:
             return 0.0, 1.0
-        p5 = float(np.percentile(finite, 5.0))
-        p95 = float(np.percentile(finite, 95.0))
-        if p95 <= p5:
-            p95 = p5 + 1e-6
-        return p5, p95
-
-    base = plt.get_cmap("coolwarm")
-    cmap = LinearSegmentedColormap.from_list(
-        "coolwarm_soft_sat",
-        base(np.linspace(0.025, 0.975, 256)),
-    )
+        p_low = float(np.percentile(finite, 15.0))
+        p_high = float(np.percentile(finite, 85.0))
+        if p_high <= p_low:
+            p_high = p_low + 1e-6
+        return p_low, p_high
 
     rel_tok = np.arange(-span, span + 1, dtype=np.int32)
+    heatmaps: Dict[str, Dict[str, np.ndarray]] = {"line1": {}, "line2": {}}
+    for which in ("line1", "line2"):
+        for anchor in anchors:
+            heatmaps[which][anchor] = _build_heat(
+                which=which,
+                anchor=anchor,
+                use_log=True,
+            )
+
+    shared_bounds = {
+        which: _get_shared_scale_bounds(list(heatmaps[which].values()))
+        for which in ("line1", "line2")
+    }
+
     generated = 0
     for anchor in anchors:
         for which in ("line1", "line2"):
-            # Saved JSON is CE/NLL; visualize log-likelihood by negating it.
-            mat_nll = _build_heat(which=which, anchor=anchor)
-            mat = -mat_nll
-            vmin, vmax = _get_scale_bounds(mat)
+            mat = heatmaps[which][anchor]
+            vmin, vmax = shared_bounds[which]
 
-            fig, ax = plt.subplots(figsize=(11.0, 6.5), dpi=180)
-            img = ax.imshow(
-                mat,
-                aspect="auto",
-                interpolation="nearest",
-                origin="lower",
-                cmap=cmap,
-                vmin=vmin,
-                vmax=vmax,
-                extent=(float(rel_tok[0]), float(rel_tok[-1]), -0.5, 31.5),
-            )
-            cbar = fig.colorbar(img, ax=ax)
-            cbar.set_label("Log-likelihood value (negated from CE/NLL, P5/P95 from layers 10-20)")
-
-            line_desc = (
-                "line1 = user multimodal log-likelihood (from negated CE; likely listening-focus)"
-                if which == "line1"
-                else "line2 = model multimodal log-likelihood (from negated CE; likely speaking-focus)"
-            )
-            ax.set_title(f"Logit-Lens Heatmap | {anchor} | {which}\n{line_desc}")
-            ax.set_xlabel("Relative token index")
-            ax.set_ylabel("Layer")
-            ax.set_yticks(np.arange(0, 32, 1))
-            ax.set_ylim(-0.5, 31.5)
-
-            out_png = root / f"logit_lens_heatmap_{anchor}_{which}.png"
-            fig.tight_layout()
-            fig.savefig(out_png, bbox_inches="tight")
-            plt.close(fig)
-            print(f"[plot-logit-heatmap] Saved {out_png}")
-            generated += 1
+            if which == "line1":
+                out_prefix = root / f"logit_lens_heatmap_{anchor}_perception_score"
+                pdf_path, png_path = plot_layerwise_turn_transition_heatmap(
+                    mat,
+                    rel_tok,
+                    out_prefix,
+                    vmin=vmin,
+                    vmax=vmax,
+                    title=sper_title,
+                )
+            else:
+                out_prefix = root / f"logit_lens_heatmap_{anchor}_generation_score"
+                pdf_path, png_path = plot_generation_score_heatmap(
+                    mat,
+                    rel_tok,
+                    out_prefix,
+                    vmin=vmin,
+                    vmax=vmax,
+                    title=sgen_title,
+                )
+            print(f"[plot-logit-heatmap] Saved {pdf_path}")
+            print(f"[plot-logit-heatmap] Saved {png_path}")
+            generated += 2
 
     print(
-        f"[plot-logit-heatmap] Done. Generated {generated} heatmaps from {used_samples} samples."
+        f"[plot-logit-heatmap] Done. Generated {generated} files from {used_samples} samples."
     )
 
 # ---------------------------------------------------------------------------
@@ -2763,7 +3076,7 @@ def main() -> None:
         "--plot-logit-lens-dataset",
         type=str,
         metavar="ROOT_DIR",
-        help="Plot step-n logit-lens CE + aligned waveforms for ROOT_DIR/*/output_hidden(.pt).",
+        help="Plot step-n logit-lens probability + aligned waveforms for ROOT_DIR/*/output_hidden(.pt).",
     )
     group.add_argument(
         "--plot-attention-heatmap-turn-taking",
@@ -2776,7 +3089,7 @@ def main() -> None:
         type=str,
         nargs="+",
         metavar="ROOT_DIR",
-        help="Average saved in_out_ce.json traces aligned by question_start/interrupt_start. Accepts one or more ROOT_DIR values and overlays them.",
+        help="Average saved current in_out_ce_*.json probability traces aligned by question_start/interrupt_start. Accepts one or more ROOT_DIR values and overlays them.",
     )
     group.add_argument(
         "--plot-logit-lens-heatmap",
@@ -2784,7 +3097,7 @@ def main() -> None:
         metavar="ROOT_DIR",
         help=(
             "Build layer-vs-token heatmaps from saved "
-            "logit_lens_turn_taking_layer_<layer>_<anchor>_<ce_type>.json files "
+            "logit_lens_turn_taking_layer_<layer>_<anchor>_<prob_type>.json files "
             "for layers 0..31."
         ),
     )
@@ -2850,7 +3163,26 @@ def main() -> None:
         default=5,
         help="Half-window size for hidden smoothing (default: 5).",
     )
-
+    ap.add_argument(
+        "--use-all-codebook",
+        action="store_true",
+        help=(
+            "For logit-lens probability, average audio probability across all "
+            "inferred depformer codebooks instead of using only codebook 0."
+        ),
+    )
+    ap.add_argument(
+        "--sper-title",
+        type=str,
+        default="Layer-wise Perception Score Around Turn Transition",
+        help="Title for perception-score heatmaps generated by --plot-logit-lens-heatmap.",
+    )
+    ap.add_argument(
+        "--sgen-title",
+        type=str,
+        default="Layer-wise Generation Score Around Turn Transition",
+        help="Title for generation-score heatmaps generated by --plot-logit-lens-heatmap.",
+    )
     args = ap.parse_args()
 
     # ---- dispatch -----------------------------------------------------------
@@ -2951,6 +3283,7 @@ def main() -> None:
             moshi_weight=args.moshi_weight,
             device=args.device,
             ma_window=args.window,
+            use_all_codebook=args.use_all_codebook,
         )
 
     elif args.plot_attention_heatmap_turn_taking:
@@ -2967,12 +3300,17 @@ def main() -> None:
         )
 
     elif args.plot_logit_lens_heatmap:
-        logit_lens_heatmap(args.plot_logit_lens_heatmap)
+        logit_lens_heatmap(
+            args.plot_logit_lens_heatmap,
+            sper_title=args.sper_title,
+            sgen_title=args.sgen_title,
+        )
 
     elif args.plot_attention_by_subseqent_token_heatmap:
         plot_attention_by_subseqent_token_heatmap(
             root_dir=args.plot_attention_by_subseqent_token_heatmap,
             span=max(1, int(args.window)),
+            window=max(1, int(args.window)),
         )
 
 
